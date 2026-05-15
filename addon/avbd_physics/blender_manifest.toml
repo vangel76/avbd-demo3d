@@ -1,0 +1,26 @@
+schema_version = "1.0.0"
+
+id = "avbd_physics"
+version = "0.2.0"
+name = "AVBD Physics"
+tagline = "Augmented Vertex Block Descent rigid body simulation"
+maintainer = "Chris Giles"
+type = "add-on"
+
+website = "https://graphics.cs.utah.edu/research/projects/avbd/"
+
+tags = ["Physics", "Animation"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:MIT",
+]
+
+# The native solver libraries are bundled per platform under lib/<platform>/ and
+# loaded directly via ctypes (see avbd_native.py), so no Python wheels are used.
+# A single universal package ships every platform's binary; the add-on selects
+# the matching one at runtime.
+
+[permissions]
+# None: the add-on only touches the current .blend scene.

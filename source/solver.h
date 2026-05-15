@@ -11,17 +11,9 @@
 
 #pragma once
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#endif
-
-#ifdef TARGET_OS_MAC
-#include <OpenGL/GL.h>
-#else
-#include <GL/gl.h>
-#endif
+// NOTE: This header is part of the headless AVBD core library. It must not pull in
+// any windowing, OpenGL, or UI dependencies so it can be compiled into avbd_core and
+// the avbd shared library. Rendering includes live in the demo (main.cpp) instead.
 
 #include "maths.h"
 
@@ -35,6 +27,41 @@ struct Rigid;
 struct Force;
 struct Manifold;
 struct Solver;
+class ThreadPool;
+
+// An immutable convex polyhedron used as a collision shape. Vertices are stored in
+// body-local space, with the centre of mass at the origin. Face and edge connectivity
+// is kept so the separating-axis test and contact clipping can run on arbitrary
+// convex shapes, not just boxes. A box body has hull == nullptr (see Rigid::hull).
+struct ConvexHull
+{
+    int numVerts;
+    int numFaces;
+    int numEdges;
+    float3 *verts;       // [numVerts]   local-space vertices, centre of mass at origin
+    float3 *faceNormals; // [numFaces]   outward unit normals
+    int *faceStart;      // [numFaces+1] offsets into faceVerts
+    int *faceVerts;      // [.]          per-face vertex indices, wound CCW about the normal
+    int *edges;          // [numEdges*2] unique undirected edges as vertex-index pairs
+    float radius;        // bounding-sphere radius about the origin
+    float3 aabbHalf;     // local axis-aligned half extents about the origin
+
+    ~ConvexHull();
+
+    // Builds a hull from polygon faces. faceVertCounts[f] gives the vertex count of
+    // face f and faceIndices concatenates the per-face vertex indices. Face normals,
+    // edges, winding, and bounds are derived. Returns nullptr on degenerate input.
+    static ConvexHull *create(const float3 *points, int numPoints,
+                              const int *faceVertCounts, const int *faceIndices, int numFaces);
+
+    // Builds an axis-aligned box hull of the given full-width size.
+    static ConvexHull *createBox(float3 size);
+};
+
+// Integrates mass, centre of mass, and the (diagonal-approximated) inertia tensor
+// of a convex polyhedron of uniform density. Used by the convex Rigid constructor.
+void computeHullMassProperties(const ConvexHull *hull, float density,
+                               float &massOut, float3 &comOut, float3 &momentOut);
 
 // Holds all the state for a single rigid body that is needed by AVBD
 struct Rigid
@@ -51,13 +78,24 @@ struct Rigid
     float3 velocityLin;
     float3 velocityAng;
     float3 prevVelocityLin;
-    float3 size; // Full widths in each dimension
+    float3 size; // Full widths in each dimension (AABB extents for a hull body)
     float mass;
     float3 moment;
     float friction;
     float radius;
+    ConvexHull *hull; // Convex collision shape; nullptr means an oriented box of `size`
+    int index;        // Solver scratch: position in the per-step body array
+    int color;        // Solver scratch: graph-colouring group (-1 for static bodies)
+    bool asleep;      // Sleeping bodies are frozen and skipped by the solver until disturbed
+    float sleepTimer; // Seconds spent continuously below the rest velocity threshold
 
+    // Box body: mass properties are derived analytically from `size` and `density`.
     Rigid(Solver *solver, float3 size, float density, float friction, float3 position, float3 velocity = float3{0, 0, 0});
+
+    // Convex-hull body: takes ownership of `hull`. Mass, centre of mass, and inertia
+    // are integrated over the polyhedron; `position` is the world centre of mass.
+    Rigid(Solver *solver, ConvexHull *hull, float density, float friction, float3 position, float3 velocity = float3{0, 0, 0});
+
     ~Rigid();
 
     bool constrainedTo(Rigid *other) const;
@@ -167,6 +205,11 @@ struct Manifold : Force
     static int collide(Rigid *bodyA, Rigid *bodyB, Contact *contacts, float3x3 &basis);
 };
 
+// Narrow-phase collision routines. Manifold::collide dispatches to collideOBB when
+// both bodies are boxes (fast tuned path) and collideConvex otherwise.
+int collideOBB(Rigid *bodyA, Rigid *bodyB, Manifold::Contact *contacts, float3x3 &basis);
+int collideConvex(Rigid *bodyA, Rigid *bodyB, Manifold::Contact *contacts, float3x3 &basis);
+
 // Core solver class which holds all the rigid bodies and forces, and has logic to step the simulation forward in time
 struct Solver
 {
@@ -179,8 +222,19 @@ struct Solver
     float betaAng;  // Penalty ramping parameter for angular constraints
     float gamma; // Warmstarting decay parameter
 
+    // Sleeping: bodies that stay below the rest velocity thresholds for
+    // sleepTime seconds are frozen and skipped by the solver until a moving
+    // body disturbs them. This removes resting jitter and speeds up settled scenes.
+    bool sleepEnabled;
+    float sleepThresholdLin; // Linear speed below which a body counts as resting
+    float sleepThresholdAng; // Angular speed below which a body counts as resting
+    float sleepTime;         // Time below the thresholds before a body sleeps
+
     Rigid *bodies;
     Force *forces;
+
+    int threads;      // Worker lane count for the solver (0 = hardware concurrency)
+    ThreadPool *pool; // Persistent thread pool; rebuilt by setThreads
 
     Solver();
     ~Solver();
@@ -189,4 +243,8 @@ struct Solver
     void clear();
     void defaultParams();
     void step();
+
+    // Sets the CPU thread count and rebuilds the thread pool. n = 0 selects the
+    // hardware concurrency; n = 1 runs the solver single-threaded.
+    void setThreads(int n);
 };

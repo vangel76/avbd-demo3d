@@ -5,3 +5,11 @@
 /build
 /build-web
 imgui.ini
+
+# Add-on packaging output
+/dist
+
+# Python bytecode (add-on)
+__pycache__/
+*.pyc
+*.pyo

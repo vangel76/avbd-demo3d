@@ -434,7 +434,9 @@ inline int buildEdgeContact(Rigid* bodyA, Rigid* bodyB, const OBB& boxA, const O
 
 } // namespace
 
-int Manifold::collide(Rigid* bodyA, Rigid* bodyB, Contact* contacts, float3x3& basisOut)
+// Box-vs-box narrow phase: separating-axis test over face and edge axes, followed by
+// face clipping or edge closest-points. Dispatched from Manifold::collide.
+int collideOBB(Rigid* bodyA, Rigid* bodyB, Manifold::Contact* contacts, float3x3& basisOut)
 {
     OBB boxA = makeOBB(bodyA);
     OBB boxB = makeOBB(bodyB);

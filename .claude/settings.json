@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"C:\\\\projekte\\\\DevSoftware\\\\avbd-demo3d\" -Recurse -File)",
+      "Bash(Select-Object FullName)",
+      "Bash(Sort-Object FullName)",
+      "Bash(Format-Table -HideTableHeaders)",
+      "Bash(python -c \"import pypdf; print\\('pypdf ok'\\)\")",
+      "Bash(python -c \"import PyPDF2; print\\('PyPDF2 ok'\\)\")",
+      "Read(//c/tmp/**)",
+      "Bash(pdftotext -layout \"c:/projekte/DevSoftware/avbd-demo3d/Augmented_VBD-SIGGRAPH25_RTL.pdf\" rtl.txt)",
+      "Bash(pdftotext -layout \"c:/projekte/DevSoftware/avbd-demo3d/Augmented_VBD-SIGGRAPH25.pdf\" main.txt)",
+      "Bash(pdfinfo \"c:/projekte/DevSoftware/avbd-demo3d/Augmented_VBD-SIGGRAPH25.pdf\")",
+      "Bash(cmake --version)",
+      "Bash(echo \"exit:$?\")",
+      "Bash(git submodule *)",
+      "Bash(cmake -S . -B build -DCMAKE_BUILD_TYPE=Release)",
+      "Bash(cmake --build build --target avbd_core --config Release)",
+      "Bash(cmake -S . -B build)",
+      "Bash(cmake --build build --target avbd_demo3d --config Release)",
+      "Bash(cmake --build build --target avbd_test --config Release)",
+      "Bash(./build/Release/avbd_test.exe)",
+      "Bash(cmake --build build --target avbd --config Release)",
+      "Bash(/c/Users/vali/AppData/Local/Programs/Python/Python311/python.exe -c ' *)",
+      "Bash(cp fullpaper.txt \"c:/projekte/DevSoftware/avbd-demo3d/build/fullpaper.txt\")"
+    ]
+  }
+}

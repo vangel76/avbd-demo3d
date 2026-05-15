@@ -16,6 +16,15 @@ Manifold::Manifold(Solver *solver, Rigid *bodyA, Rigid *bodyB)
 {
 }
 
+int Manifold::collide(Rigid *bodyA, Rigid *bodyB, Contact *contacts, float3x3 &basis)
+{
+    // Box-vs-box uses the fast tuned OBB path; anything involving a convex hull
+    // goes through the general separating-axis convex routine.
+    if (bodyA->hull || bodyB->hull)
+        return collideConvex(bodyA, bodyB, contacts, basis);
+    return collideOBB(bodyA, bodyB, contacts, basis);
+}
+
 bool Manifold::initialize()
 {
     // Compute friction
@@ -90,8 +99,9 @@ void Manifold::updatePrimal(Rigid *body, float alpha, float3x3 &lhsLin, float3x3
         float3x3 K = diagonal(contacts[i].penalty.x, contacts[i].penalty.y, contacts[i].penalty.z);
         float3 C = contacts[i].C0 * (1 - alpha) + jALin * dqALin + jBLin * dqBLin + jAAng * dqAAng + jBAng * dqBAng;
 
-        // Compute force
-        float3 F = K * C + contacts[i].lambda;
+        // Compute force before clamping (lambda+ in Eq. 13)
+        float3 Fpre = K * C + contacts[i].lambda;
+        float3 F = Fpre;
 
         // Clamp normal force
         F[0] = min(F[0], 0.0f);
@@ -105,16 +115,30 @@ void Manifold::updatePrimal(Rigid *body, float alpha, float3x3 &lhsLin, float3x3
             F[2] *= bounds / frictionScale;
         }
 
+        // Stiffness rescaling for the Hessian (Eq. 14). When the normal force is
+        // clamped (the contact wants to separate, lambda_max = 0), the true
+        // Hessian of the clamped force is zero. Using the full penalty stiffness
+        // there over-stiffens boundary contacts and destabilizes tall stacks;
+        // instead we rescale it so k * C matches the clamped force. Friction
+        // keeps the simple unclamped Hessian, as in the AVBD paper.
+        float3 Klhs = contacts[i].penalty;
+        if (Fpre[0] > 0.0f && fabsf(C[0]) > 1.0e-9f)
+        {
+            float kRescaled = -contacts[i].lambda[0] / C[0];
+            Klhs[0] = clamp(kRescaled, PENALTY_MIN, contacts[i].penalty[0]);
+        }
+        float3x3 Kh = diagonal(Klhs.x, Klhs.y, Klhs.z);
+
         // Choose jacobian depending on input body
         float3x3 jLin = body == bodyA ? jALin : jBLin;
         float3x3 jAng = body == bodyA ? jAAng : jBAng;
 
-        // Stamp into LHS
+        // Stamp into LHS (using the rescaled stiffness, Eq. 14)
         float3x3 jLinT = transpose(jLin);
         float3x3 jAngT = transpose(jAng);
-        float3x3 jAngTk = jAngT * K;
+        float3x3 jAngTk = jAngT * Kh;
 
-        lhsLin += jLinT * K * jLin;
+        lhsLin += jLinT * Kh * jLin;
         lhsAng += jAngTk * jAng;
         lhsCross += jAngTk * jLin;
 
