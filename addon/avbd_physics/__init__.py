@@ -17,7 +17,7 @@ Blender objects.
 bl_info = {
     "name": "AVBD Physics",
     "author": "Chris Giles; AVBD by Giles, Diaz, Yuksel (SIGGRAPH 2025)",
-    "version": (0, 3, 1),
+    "version": (0, 3, 5),
     "blender": (3, 6, 0),
     "location": "Properties > Scene & Physics, View3D > Sidebar > AVBD",
     "description": "Augmented Vertex Block Descent rigid body physics (bake & live preview)",

@@ -68,6 +68,15 @@ add_executable(avbd_test tests/test_convex.cpp)
 target_link_libraries(avbd_test PRIVATE avbd_core)
 
 # ---------------------------------------------------------------------------
+# avbd_bench : allocation / throughput benchmark for the solver core.
+#
+# Times Solver::step() with Solver::optimizeAlloc off vs on (allocate-per-step
+# vs reused scratch buffers) on a heavy rigid-body scene. Run: ./build/Release/avbd_bench.exe
+# ---------------------------------------------------------------------------
+add_executable(avbd_bench tests/benchmark.cpp)
+target_link_libraries(avbd_bench PRIVATE avbd_core)
+
+# ---------------------------------------------------------------------------
 # avbd_demo3d : interactive demo / visual test bed (executable)
 #
 # Built only when the SDL/ImGui submodules are checked out. The headless

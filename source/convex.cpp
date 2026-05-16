@@ -133,22 +133,41 @@ void closestPointsOnSegments(float3 p0, float3 p1, float3 q0, float3 q1, float3 
     c1 = q0 + d2 * t;
 }
 
-// World-space view of a hull for one collision query.
+// Largest hull (vertex / face count) handled with inline storage. Hulls bigger
+// than this fall back to a heap allocation; most collision proxies -- boxes and
+// simple convex shells -- are far smaller.
+static const int kHullInlineCap = 64;
+
+// World-space view of a hull for one collision query. Uses inline storage so the
+// common case does no heap allocation: collideConvex runs in parallel across
+// every contact during force initialisation, and per-call heap allocation there
+// serialises all worker threads on the allocator lock.
 struct HullWorld
 {
     const ConvexHull *hull;
-    std::vector<float3> verts;   // world-space vertices
-    std::vector<float3> normals; // world-space face normals
-    float3 center;               // world centre of mass
+    float3 *verts;   // [hull->numVerts] world-space vertices
+    float3 *normals; // [hull->numFaces] world-space face normals
+    float3 center;   // world centre of mass
+
+    HullWorld() : hull(nullptr), verts(nullptr), normals(nullptr) {}
+    ~HullWorld()
+    {
+        if (verts && verts != vertsInline)
+            delete[] verts;
+        if (normals && normals != normalsInline)
+            delete[] normals;
+    }
+    HullWorld(const HullWorld &) = delete;            // owns raw pointers
+    HullWorld &operator=(const HullWorld &) = delete;
 
     void build(const Rigid *body, const ConvexHull *h)
     {
         hull = h;
         center = body->positionLin;
-        verts.resize(h->numVerts);
+        verts = h->numVerts <= kHullInlineCap ? vertsInline : new float3[h->numVerts];
         for (int i = 0; i < h->numVerts; ++i)
             verts[i] = transform(body->positionLin, body->positionAng, h->verts[i]);
-        normals.resize(h->numFaces);
+        normals = h->numFaces <= kHullInlineCap ? normalsInline : new float3[h->numFaces];
         for (int i = 0; i < h->numFaces; ++i)
             normals[i] = rotate(body->positionAng, h->faceNormals[i]);
     }
@@ -156,21 +175,25 @@ struct HullWorld
     float supportMax(float3 n) const
     {
         float m = -FLT_MAX;
-        for (const float3 &v : verts)
-            m = max(m, dot(n, v));
+        for (int i = 0; i < hull->numVerts; ++i)
+            m = max(m, dot(n, verts[i]));
         return m;
     }
     float supportMin(float3 n) const
     {
         float m = FLT_MAX;
-        for (const float3 &v : verts)
+        for (int i = 0; i < hull->numVerts; ++i)
         {
-            float d = dot(n, v);
+            float d = dot(n, verts[i]);
             if (d < m)
                 m = d;
         }
         return m;
     }
+
+private:
+    float3 vertsInline[kHullInlineCap];
+    float3 normalsInline[kHullInlineCap];
 };
 
 // Largest separation of `other` from a face plane of `ref`. Positive => disjoint.
@@ -264,7 +287,9 @@ int buildFaceManifold(Rigid *bodyA, Rigid *bodyB, const HullWorld &a, const Hull
     const ConvexHull *rh = ref.hull;
     int rStart = rh->faceStart[referenceFace];
     int rCount = rh->faceStart[referenceFace + 1] - rStart;
-    std::vector<float3> refPoly(rCount);
+    if (rCount > kHullInlineCap)
+        rCount = kHullInlineCap;
+    float3 refPoly[kHullInlineCap];
     for (int i = 0; i < rCount; ++i)
         refPoly[i] = ref.verts[rh->faceVerts[rStart + i]];
 
@@ -285,14 +310,16 @@ int buildFaceManifold(Rigid *bodyA, Rigid *bodyB, const HullWorld &a, const Hull
     int iStart = ih->faceStart[incidentFace];
     int iCount = ih->faceStart[incidentFace + 1] - iStart;
 
-    std::vector<float3> bufA(64), bufB(64);
+    float3 bufA[64], bufB[64];
+    if (iCount > 64)
+        iCount = 64;
     int count = iCount;
     for (int i = 0; i < iCount; ++i)
         bufA[i] = inc.verts[ih->faceVerts[iStart + i]];
 
     // Clip against each side plane of the reference face.
-    float3 *src = bufA.data();
-    float3 *dst = bufB.data();
+    float3 *src = bufA;
+    float3 *dst = bufB;
     for (int i = 0; i < rCount && count > 0; ++i)
     {
         float3 e = refPoly[(i + 1) % rCount] - refPoly[i];
@@ -331,19 +358,19 @@ int buildFaceManifold(Rigid *bodyA, Rigid *bodyB, const HullWorld &a, const Hull
         float3 nAB = referenceIsA ? refNormal : -refNormal;
         float3 xA = a.verts[0];
         float bestA = -FLT_MAX;
-        for (const float3 &v : a.verts)
-            if (dot(nAB, v) > bestA)
+        for (int i = 0; i < a.hull->numVerts; ++i)
+            if (dot(nAB, a.verts[i]) > bestA)
             {
-                bestA = dot(nAB, v);
-                xA = v;
+                bestA = dot(nAB, a.verts[i]);
+                xA = a.verts[i];
             }
         float3 xB = b.verts[0];
         float bestB = -FLT_MAX;
-        for (const float3 &v : b.verts)
-            if (dot(-nAB, v) > bestB)
+        for (int i = 0; i < b.hull->numVerts; ++i)
+            if (dot(-nAB, b.verts[i]) > bestB)
             {
-                bestB = dot(-nAB, v);
-                xB = v;
+                bestB = dot(-nAB, b.verts[i]);
+                xB = b.verts[i];
             }
         addContact(bodyA, bodyB, contacts, contactCount, midpoints, xA, xB, featurePrefix);
     }

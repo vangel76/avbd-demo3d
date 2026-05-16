@@ -291,6 +291,13 @@ class Cloth:
         b = self._buf
         return [(b[i * 3], b[i * 3 + 1], b[i * 3 + 2]) for i in range(self.vertex_count)]
 
+    def vertices_buffer(self):
+        """Fills and returns the raw world-space vertex buffer (a ctypes float
+        array, xyz interleaved). Avoids building a Python list -- callers can
+        wrap it with numpy. The buffer is reused across calls; copy if retained."""
+        _cloth_get_vertices(self._handle, self._buf)
+        return self._buf
+
     def destroy(self):
         if self._handle:
             _cloth_destroy(self._handle)

@@ -13,6 +13,7 @@ import time
 
 import bmesh
 import bpy
+import numpy as np
 from bpy.app.handlers import persistent
 from bpy.props import IntProperty, StringProperty
 
@@ -21,9 +22,73 @@ from . import simulation
 _BAKED_PATHS = ("location", "rotation_quaternion")
 
 
-def _keyframe(obj, frame):
-    for path in _BAKED_PATHS:
-        obj.keyframe_insert(data_path=path, frame=frame)
+def _find_baked_fcurve(action, data_path, index):
+    """Locates a baked F-curve, handling both legacy and layered (4.4+) actions."""
+    layers = getattr(action, "layers", None)
+    if layers:
+        for layer in layers:
+            for strip in layer.strips:
+                for bag in getattr(strip, "channelbags", []):
+                    fc = bag.fcurves.find(data_path, index=index)
+                    if fc:
+                        return fc
+        return None
+    legacy = getattr(action, "fcurves", None)
+    return legacy.find(data_path, index=index) if legacy is not None else None
+
+
+def _bulk_keyframe(obj, frames, locs, rots):
+    """Writes all collected pose samples as keyframes in one bulk pass per
+    F-curve (keyframe_points.add + foreach_set). Far faster than a per-frame
+    keyframe_insert when baking thousands of bodies.
+
+    frames: list of int. locs: list of (x, y, z). rots: list of (w, x, y, z).
+    """
+    n = len(frames)
+    if n == 0:
+        return
+
+    if obj.animation_data is None:
+        obj.animation_data_create()
+    if obj.animation_data.action is None:
+        obj.animation_data.action = bpy.data.actions.new(obj.name + "_AVBD")
+
+    # rotation_quaternion keyframes only drive the object in quaternion mode.
+    if obj.rotation_mode != 'QUATERNION':
+        obj.rotation_mode = 'QUATERNION'
+
+    # Clear any earlier bake, then create the F-curves through the official
+    # keyframe_insert path (one key each) so this stays correct across legacy
+    # and layered actions; the remaining keys are bulk-filled below.
+    _remove_baked_keyframes(obj)
+    obj.keyframe_insert(data_path="location", frame=frames[0])
+    obj.keyframe_insert(data_path="rotation_quaternion", frame=frames[0])
+
+    action = obj.animation_data.action
+    fr = np.asarray(frames, dtype=np.float32)
+    loc = np.asarray(locs, dtype=np.float32)  # (n, 3)
+    rot = np.asarray(rots, dtype=np.float32)  # (n, 4)
+    channels = (
+        ("location", 0, loc[:, 0]),
+        ("location", 1, loc[:, 1]),
+        ("location", 2, loc[:, 2]),
+        ("rotation_quaternion", 0, rot[:, 0]),
+        ("rotation_quaternion", 1, rot[:, 1]),
+        ("rotation_quaternion", 2, rot[:, 2]),
+        ("rotation_quaternion", 3, rot[:, 3]),
+    )
+    for data_path, index, values in channels:
+        fc = _find_baked_fcurve(action, data_path, index)
+        if fc is None:
+            continue
+        existing = len(fc.keyframe_points)
+        if existing < n:
+            fc.keyframe_points.add(n - existing)
+        co = np.empty(2 * n, dtype=np.float32)
+        co[0::2] = fr        # keyframe x = frame
+        co[1::2] = values    # keyframe y = channel value
+        fc.keyframe_points.foreach_set("co", co)
+        fc.update()
 
 
 def _remove_baked_keyframes(obj):
@@ -46,11 +111,14 @@ def _remove_baked_keyframes(obj):
                             bag.fcurves.remove(fc)
                             removed += 1
     else:
-        # Legacy (pre-4.4) actions
-        for fc in list(action.fcurves):
-            if fc.data_path in _BAKED_PATHS:
-                action.fcurves.remove(fc)
-                removed += 1
+        # Legacy (pre-4.4) actions expose F-curves directly; on 4.4+/5.x the
+        # compatibility accessor is gone, so guard it.
+        legacy = getattr(action, "fcurves", None)
+        if legacy is not None:
+            for fc in list(legacy):
+                if fc.data_path in _BAKED_PATHS:
+                    legacy.remove(fc)
+                    removed += 1
     return removed
 
 
@@ -74,9 +142,13 @@ def apply_cloth_cache(scene, depsgraph=None):
         if obj is None:
             continue
         mesh = obj.data
-        count = min(len(verts), len(mesh.vertices))
-        for i in range(count):
-            mesh.vertices[i].co = verts[i]
+        # The cache stores a flat float array; apply it in one bulk write.
+        if len(verts) == len(mesh.vertices) * 3:
+            mesh.vertices.foreach_set("co", verts)
+        else:
+            count = min(len(verts) // 3, len(mesh.vertices))
+            for i in range(count):
+                mesh.vertices[i].co = verts[i * 3:i * 3 + 3]
         mesh.update()
 
 
@@ -91,11 +163,16 @@ class AVBD_OT_bake(bpy.types.Operator):
         scene = context.scene
         settings = scene.avbd
 
+        # Debug timing: total + per-section, printed to the console after the bake.
+        t_total = time.perf_counter()
+        t_build = time.perf_counter()
         try:
             solver, records = simulation.build_solver(context)
         except RuntimeError as exc:
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
+        t_build = time.perf_counter() - t_build
+        t_solve = t_read = t_cloth = 0.0
 
         if not records:
             solver.destroy()
@@ -107,12 +184,6 @@ class AVBD_OT_bake(bpy.types.Operator):
         window = context.window_manager
         window.progress_begin(f0, f1)
 
-        def keyframe_active(frame):
-            for name in records:
-                obj = scene.objects.get(name)
-                if obj is not None and obj.avbd_body.body_type == 'ACTIVE':
-                    _keyframe(obj, frame)
-
         def cache_cloth(frame):
             for name, verts in simulation.cloth_local_positions(scene, records).items():
                 _cloth_cache.setdefault(name, {})[frame] = verts
@@ -120,33 +191,72 @@ class AVBD_OT_bake(bpy.types.Operator):
         # Fresh cloth cache for this bake.
         _cloth_cache.clear()
 
+        # Per active object, accumulate (frame, location, quaternion) samples.
+        # The keyframes are written in one bulk pass after the simulation rather
+        # than an O(frames x bodies) keyframe_insert every frame.
+        tracks = {}
+
+        # apply=False: a bake only needs the transform values to keyframe them,
+        # so the per-frame object writes (and the depsgraph churn they cause)
+        # are skipped -- the objects are driven by the keyframes afterwards.
+        def record_pose(frame):
+            for obj, loc, rot in simulation.read_active_bodies(scene, records, apply=False):
+                track = tracks.get(obj)
+                if track is None:
+                    track = tracks[obj] = ([], [], [])
+                track[0].append(frame)
+                track[1].append((loc.x, loc.y, loc.z))
+                track[2].append((rot.w, rot.x, rot.y, rot.z))
+
         # Capture the initial pose of every active body and cloth at f0.
-        simulation.read_active_bodies(scene, records)
-        keyframe_active(f0)
+        ts = time.perf_counter()
+        record_pose(f0)
+        t_read += time.perf_counter() - ts
+        ts = time.perf_counter()
         cache_cloth(f0)
+        t_cloth += time.perf_counter() - ts
 
         for frame in range(f0 + 1, f1 + 1):
+            ts = time.perf_counter()
             for _ in range(settings.substeps):
                 solver.step()
-            simulation.read_active_bodies(scene, records)
-            keyframe_active(frame)
+            t_solve += time.perf_counter() - ts
+
+            ts = time.perf_counter()
+            record_pose(frame)
+            t_read += time.perf_counter() - ts
+
+            ts = time.perf_counter()
             cache_cloth(frame)
+            t_cloth += time.perf_counter() - ts
+
             window.progress_update(frame)
 
-            # Show baking progress in the viewport every 10 frames. redraw_timer
-            # forces a repaint mid-operator; it has no window in background mode.
-            if (frame - f0) % 10 == 0:
-                scene.frame_set(frame)
-                try:
-                    bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
-                except RuntimeError:
-                    pass
+        # Write every collected track as keyframes in one bulk pass per object.
+        t_key = time.perf_counter()
+        for obj, (frames, locs, rots) in tracks.items():
+            _bulk_keyframe(obj, frames, locs, rots)
+        t_key = time.perf_counter() - t_key
 
         window.progress_end()
         solver.destroy()
         scene.frame_set(f0)
-        self.report({'INFO'}, "Baked {} bodies over frames {}-{}".format(
-            len(records), f0, f1))
+
+        # Debug timing report to the console.
+        total = time.perf_counter() - t_total
+        nframes = f1 - f0 + 1
+        other = max(0.0, total - t_build - t_solve - t_read - t_cloth - t_key)
+        print("[AVBD] bake: {} bodies, {} frames -> {:.2f} s total "
+              "({:.1f} ms/frame)".format(len(records), nframes, total,
+                                         1000.0 * total / nframes))
+        for label, secs in (("build solver", t_build), ("solver step", t_solve),
+                            ("pose readback", t_read), ("cloth cache", t_cloth),
+                            ("keyframing", t_key), ("other", other)):
+            print("[AVBD]   {:<14} {:8.2f} s  {:5.1f}%".format(
+                label, secs, 100.0 * secs / total if total else 0.0))
+
+        self.report({'INFO'}, "Baked {} bodies, {} frames in {:.1f} s".format(
+            len(records), nframes, total))
         return {'FINISHED'}
 
 

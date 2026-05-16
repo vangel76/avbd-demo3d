@@ -12,15 +12,17 @@
 #include "solver.h"
 #include "parallel.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
 
 Solver::Solver()
-    : bodies(0), forces(0), threads(0), pool(0)
+    : bodies(0), forces(0), threads(0), pool(0), profileEnabled(false)
 {
     defaultParams();
+    profile.reset();
     pool = new ThreadPool(threads);
 }
 
@@ -248,15 +250,67 @@ void broadphase(const std::vector<Body *> &bodies, ThreadPool *pool,
 
     auto coord = [invCell](float v) { return (int)floorf(v * invCell); };
 
-    std::unordered_map<uint64_t, std::vector<int>> grid;
-    grid.reserve(small.size() * 2 + 1);
-    for (int idx : small)
-    {
-        float3 p = bodies[idx]->positionLin;
-        grid[packCell(coord(p.x), coord(p.y), coord(p.z))].push_back(idx);
-    }
+    // Open-addressed uniform-grid hash. The small bodies are bucketed into grid
+    // cells by a counting sort into flat arrays (cellKey / cellStart / cellCount
+    // plus a cell-grouped cellBody index list), so the per-body neighbourhood
+    // scan does cache-friendly O(1) cell lookups. This replaces a node-based
+    // std::unordered_map, whose per-lookup pointer chase dominated dense
+    // particle scenes (cloth).
+    int numSmall = (int)small.size();
+    int cap = 1;
+    while (cap < numSmall * 2 + 1)
+        cap <<= 1;
+    int mask = cap - 1;
+    const uint64_t EMPTY_CELL = ~0ull; // packCell never sets bit 63, so this is free
 
-    pool->parallelFor((int)small.size(), [&](int si) {
+    std::vector<uint64_t> cellKey(cap, EMPTY_CELL);
+    std::vector<int> cellStart(cap, 0);
+    std::vector<int> cellCount(cap, 0);
+    std::vector<int> cellBody(numSmall);
+    std::vector<uint64_t> keyOf(numSmall);
+
+    // splitmix64 finaliser, then a linear probe to the slot holding `k` (or to
+    // the empty slot where it belongs). Read-only after the build below, so it
+    // is safe to call concurrently from the scan.
+    auto slotOf = [&](uint64_t k) {
+        uint64_t h = k;
+        h ^= h >> 30;
+        h *= 0xbf58476d1ce4e5b9ull;
+        h ^= h >> 27;
+        h *= 0x94d049bb133111ebull;
+        h ^= h >> 31;
+        int s = (int)(h & (uint64_t)mask);
+        while (cellKey[s] != EMPTY_CELL && cellKey[s] != k)
+            s = (s + 1) & mask;
+        return s;
+    };
+
+    for (int si = 0; si < numSmall; ++si)
+    {
+        float3 p = bodies[small[si]]->positionLin;
+        keyOf[si] = packCell(coord(p.x), coord(p.y), coord(p.z));
+    }
+    // Pass 1: register each occupied cell and count its occupants.
+    for (int si = 0; si < numSmall; ++si)
+    {
+        int s = slotOf(keyOf[si]);
+        cellKey[s] = keyOf[si];
+        ++cellCount[s];
+    }
+    // Prefix sum -> per-cell start offset into cellBody.
+    int acc = 0;
+    for (int s = 0; s < cap; ++s)
+    {
+        cellStart[s] = acc;
+        acc += cellCount[s];
+    }
+    // Pass 2: scatter body indices, grouped by cell (small-body order within a
+    // cell, so the emitted pairs are deterministic).
+    std::vector<int> cursor = cellStart;
+    for (int si = 0; si < numSmall; ++si)
+        cellBody[cursor[slotOf(keyOf[si])]++] = small[si];
+
+    pool->parallelFor(numSmall, [&](int si) {
         int i = small[si];
         Body *a = bodies[i];
         float3 p = a->positionLin;
@@ -266,11 +320,13 @@ void broadphase(const std::vector<Body *> &bodies, ThreadPool *pool,
             for (int dy = -range; dy <= range; ++dy)
                 for (int dx = -range; dx <= range; ++dx)
                 {
-                    auto it = grid.find(packCell(cx + dx, cy + dy, cz + dz));
-                    if (it == grid.end())
+                    int s = slotOf(packCell(cx + dx, cy + dy, cz + dz));
+                    if (cellKey[s] == EMPTY_CELL)
                         continue;
-                    for (int j : it->second)
+                    int start = cellStart[s], cnt = cellCount[s];
+                    for (int t = 0; t < cnt; ++t)
                     {
+                        int j = cellBody[start + t];
                         if (j <= i)
                             continue;
                         Body *b = bodies[j];
@@ -299,7 +355,10 @@ void broadphase(const std::vector<Body *> &bodies, ThreadPool *pool,
                 continue;
             float3 dp = a->positionLin - b->positionLin;
             float r = a->radius + b->radius;
-            if (dot(dp, dp) <= r * r && !a->constrainedTo(b))
+            // constrainedTo walks the body's own force list, so query from `b`:
+            // the large body `a` accumulates contacts from everything that lands
+            // on it (thousands for a ground plane), while `b` keeps a short list.
+            if (dot(dp, dp) <= r * r && !b->constrainedTo(a))
                 pairs[i].push_back(b);
         }
     });
@@ -308,6 +367,20 @@ void broadphase(const std::vector<Body *> &bodies, ThreadPool *pool,
 
 void Solver::step()
 {
+    // Per-phase profiling. When profileEnabled is off, lap() is a no-op and no
+    // clock is read, so this has zero cost on the normal solver path.
+    using profileClock = std::chrono::high_resolution_clock;
+    profileClock::time_point profileTic;
+    if (profileEnabled)
+        profileTic = profileClock::now();
+    auto lap = [&](double &acc) {
+        if (!profileEnabled)
+            return;
+        profileClock::time_point now = profileClock::now();
+        acc += std::chrono::duration<double, std::milli>(now - profileTic).count();
+        profileTic = now;
+    };
+
     // Gather all bodies into a contiguous array for indexed parallel access.
     std::vector<Body *> bodyList;
     for (Body *body = bodies; body != 0; body = body->next)
@@ -317,6 +390,20 @@ void Solver::step()
         bodyList.push_back(body);
     }
     int numBodies = (int)bodyList.size();
+
+    // Cache each rigid body's world-space box axes once per step. collideOBB
+    // (run per contact pair during force init) reads these instead of rotating
+    // the basis vectors itself, which it otherwise repeats once per contact.
+    pool->parallelFor(numBodies, [&](int i) {
+        Body *body = bodyList[i];
+        if (body->kind != BODY_RIGID)
+            return;
+        Rigid *r = (Rigid *)body;
+        r->worldAxis[0] = rotate(r->positionAng, float3{1, 0, 0});
+        r->worldAxis[1] = rotate(r->positionAng, float3{0, 1, 0});
+        r->worldAxis[2] = rotate(r->positionAng, float3{0, 0, 1});
+    });
+    lap(profile.otherMs);
 
     // Broadphase collision detection; create the matching contact force for
     // each pair (rigid-rigid Manifold or particle-rigid ParticleContact).
@@ -335,23 +422,37 @@ void Solver::step()
                 new ParticleContact(this, p, r);
             }
         }
+    lap(profile.broadphaseMs);
 
-    // Initialize and warmstart forces; an inactive force returns false.
-    for (Force *force = forces; force != 0;)
-    {
-        if (!force->initialize())
-        {
-            Force *next = force->next;
-            delete force;
-            force = next;
-        }
-        else
-            force = force->next;
-    }
-
-    std::vector<Force *> forceList;
+    // Initialize forces; an inactive force returns false. initialize() is the
+    // narrow-phase collision recompute for contacts and is by far the heaviest
+    // pre-solve cost, but each force only reads its own bodies (positions are
+    // not mutated here) and writes its own state -- so run initialize() in
+    // parallel over every force, then do the cheap linked-list surgery serially.
+    std::vector<Force *> allForces;
     for (Force *force = forces; force != 0; force = force->next)
-        forceList.push_back(force);
+        allForces.push_back(force);
+    int numAllForces = (int)allForces.size();
+    lap(profile.forceGatherMs);
+
+    // char, not vector<bool>: bit-packed bools would make adjacent parallel
+    // writes share a byte and race.
+    std::vector<char> forceActive(numAllForces);
+    pool->parallelFor(numAllForces, [&](int i) {
+        forceActive[i] = allForces[i]->initialize() ? 1 : 0;
+    });
+
+    // Drop inactive forces (serial: ~Force() unthreads the solver + per-body
+    // lists). forceList ends up holding exactly the surviving forces.
+    std::vector<Force *> forceList;
+    forceList.reserve(numAllForces);
+    for (int i = 0; i < numAllForces; ++i)
+    {
+        if (forceActive[i])
+            forceList.push_back(allForces[i]);
+        else
+            delete allForces[i];
+    }
     int numForces = (int)forceList.size();
 
     // Wake any sleeping body that shares a force with an awake dynamic body.
@@ -379,6 +480,8 @@ void Solver::step()
             }
         }
     }
+
+    lap(profile.initMs);
 
     // Initialize and warmstart bodies (primal variables).
     pool->parallelFor(numBodies, [&](int i) {
@@ -409,6 +512,7 @@ void Solver::step()
                 r->positionAng = r->positionAng + r->velocityAng * dt;
         }
     });
+    lap(profile.warmstartMs);
 
     // Graph-colour the dynamic bodies (colored Gauss-Seidel, AVBD Algorithm 1).
     std::vector<std::vector<Body *>> colorBuckets;
@@ -438,6 +542,7 @@ void Solver::step()
             colorBuckets.resize(c + 1);
         colorBuckets[c].push_back(body);
     }
+    lap(profile.coloringMs);
 
     // Main solver loop
     for (int it = 0; it < iterations; it++)
@@ -454,6 +559,7 @@ void Solver::step()
                     updateParticlePrimal(this, (Particle *)body);
             });
         }
+        lap(profile.primalMs);
 
         // Dual update: every force is independent.
         pool->parallelFor(numForces, [&](int i) {
@@ -468,6 +574,7 @@ void Solver::step()
             if (anyActive)
                 f->updateDual(alpha);
         });
+        lap(profile.dualMs);
     }
 
     // Compute velocities (BDF1) after the final iteration.
@@ -513,4 +620,8 @@ void Solver::step()
             }
         });
     }
+
+    lap(profile.otherMs);
+    if (profileEnabled)
+        ++profile.steps;
 }

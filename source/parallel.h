@@ -15,7 +15,14 @@
 // cores. Worker threads are created once and reused; parallelFor splits a range
 // into contiguous chunks (one per worker plus the calling thread) so no thread is
 // spawned per call. parallelFor must only be called from the owning thread.
+//
+// The solver issues ~100 parallelFor calls per step (one per graph colour per
+// iteration, plus the dual pass). To keep that dispatch cheap, worker threads
+// hand off work through atomics and spin-wait for it; they only fall back to a
+// condition-variable sleep once the pool has been idle for a while, so an idle
+// pool (e.g. between viewport frames) does not burn CPU.
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -41,14 +48,19 @@ private:
     struct Worker
     {
         std::thread thread;
-        std::mutex mutex;
-        std::condition_variable cv;
+
+        // Work handoff. fn/begin/end are published by parallelFor and become
+        // visible to the worker through the release/acquire on workGen.
         const std::function<void(int)> *fn = nullptr;
         int begin = 0;
         int end = 0;
-        bool hasWork = false;
-        bool done = true;
-        bool stop = false;
+        std::atomic<unsigned> workGen{0}; // bumped to publish a new work item
+        std::atomic<bool> done{true};     // set by the worker when its chunk is done
+        std::atomic<bool> stop{false};    // pool shutdown
+
+        // Sleep fallback, used only when the worker has spun idle for a while.
+        std::mutex mutex;
+        std::condition_variable cv;
     };
 
     std::vector<Worker *> workers;

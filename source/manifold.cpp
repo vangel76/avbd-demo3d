@@ -102,11 +102,11 @@ void Manifold::updatePrimal(Body *body, float alpha, float3x3 &lhsLin, float3x3 
         float3x3 jAAng = float3x3{cross(rAWorld, jALin[0]), cross(rAWorld, jALin[1]), cross(rAWorld, jALin[2])};
         float3x3 jBAng = float3x3{cross(rBWorld, jBLin[0]), cross(rBWorld, jBLin[1]), cross(rBWorld, jBLin[2])};
 
-        float3x3 K = diagonal(contacts[i].penalty.x, contacts[i].penalty.y, contacts[i].penalty.z);
         float3 C = contacts[i].C0 * (1 - alpha) + jALin * dqALin + jBLin * dqBLin + jAAng * dqAAng + jBAng * dqBAng;
 
-        // Compute force before clamping (lambda+ in Eq. 13)
-        float3 Fpre = K * C + contacts[i].lambda;
+        // Compute force before clamping (lambda+ in Eq. 13). The penalty matrix
+        // is diagonal, so K * C is a component-wise product.
+        float3 Fpre = cwiseMul(contacts[i].penalty, C) + contacts[i].lambda;
         float3 F = Fpre;
 
         // Clamp normal force
@@ -133,18 +133,17 @@ void Manifold::updatePrimal(Body *body, float alpha, float3x3 &lhsLin, float3x3 
             float kRescaled = -contacts[i].lambda[0] / C[0];
             Klhs[0] = clamp(kRescaled, PENALTY_MIN, contacts[i].penalty[0]);
         }
-        float3x3 Kh = diagonal(Klhs.x, Klhs.y, Klhs.z);
-
         // Choose jacobian depending on input body
         float3x3 jLin = body == bodyA ? jALin : jBLin;
         float3x3 jAng = body == bodyA ? jAAng : jBAng;
 
-        // Stamp into LHS (using the rescaled stiffness, Eq. 14)
+        // Stamp into LHS (using the rescaled stiffness, Eq. 14). Klhs is the
+        // diagonal Hessian stiffness, so J^T * diag(Klhs) is a column scale.
         float3x3 jLinT = transpose(jLin);
         float3x3 jAngT = transpose(jAng);
-        float3x3 jAngTk = jAngT * Kh;
+        float3x3 jAngTk = scaleCols(jAngT, Klhs);
 
-        lhsLin += jLinT * Kh * jLin;
+        lhsLin += scaleCols(jLinT, Klhs) * jLin;
         lhsAng += jAngTk * jAng;
         lhsCross += jAngTk * jLin;
 
@@ -175,11 +174,10 @@ void Manifold::updateDual(float alpha)
         float3x3 jAAng = float3x3{cross(rAWorld, jALin[0]), cross(rAWorld, jALin[1]), cross(rAWorld, jALin[2])};
         float3x3 jBAng = float3x3{cross(rBWorld, jBLin[0]), cross(rBWorld, jBLin[1]), cross(rBWorld, jBLin[2])};
 
-        float3x3 K = diagonal(contacts[i].penalty.x, contacts[i].penalty.y, contacts[i].penalty.z);
         float3 C = contacts[i].C0 * (1 - alpha) + jALin * dqALin + jBLin * dqBLin + jAAng * dqAAng + jBAng * dqBAng;
 
-        // Compute force
-        float3 F = K * C + contacts[i].lambda;
+        // Compute force (diagonal penalty matrix -> component-wise product)
+        float3 F = cwiseMul(contacts[i].penalty, C) + contacts[i].lambda;
 
         // Clamp normal force
         F[0] = min(F[0], 0.0f);

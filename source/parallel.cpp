@@ -10,6 +10,34 @@
  */
 
 #include "parallel.h"
+#include <chrono>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
+namespace
+{
+// Hint to the CPU that this is a spin-wait iteration (lets it save power and
+// yields the pipeline to a sibling SMT thread). Falls back to a scheduler yield
+// on non-x86 targets.
+inline void cpuRelax()
+{
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_pause();
+#elif defined(__i386__) || defined(__x86_64__)
+    __builtin_ia32_pause();
+#else
+    std::this_thread::yield();
+#endif
+}
+
+// Number of spin iterations before a thread gives up and sleeps. ~thousands of
+// cpuRelax() calls cover a few hundred microseconds -- long enough to bridge the
+// gaps between the solver's back-to-back parallelFor calls without sleeping,
+// short enough that a truly idle pool sleeps almost immediately.
+const int kSpinLimit = 8000;
+} // namespace
 
 ThreadPool::ThreadPool(int numThreads)
 {
@@ -21,10 +49,7 @@ ThreadPool::ThreadPool(int numThreads)
     // workers excludes the calling thread, which is always lane 0.
     int workerCount = numThreads - 1;
     for (int i = 0; i < workerCount; ++i)
-    {
-        Worker *w = new Worker();
-        workers.push_back(w);
-    }
+        workers.push_back(new Worker());
     for (Worker *w : workers)
         w->thread = std::thread(&ThreadPool::workerLoop, this, w);
 }
@@ -33,11 +58,10 @@ ThreadPool::~ThreadPool()
 {
     for (Worker *w : workers)
     {
-        {
-            std::lock_guard<std::mutex> lk(w->mutex);
-            w->stop = true;
-            w->hasWork = true;
-        }
+        w->stop.store(true, std::memory_order_release);
+        // Bump the generation so a spinning worker notices, and notify in case
+        // it has fallen back to a CV sleep.
+        w->workGen.fetch_add(1, std::memory_order_release);
         w->cv.notify_one();
     }
     for (Worker *w : workers)
@@ -50,31 +74,45 @@ ThreadPool::~ThreadPool()
 
 void ThreadPool::workerLoop(Worker *w)
 {
+    unsigned lastGen = 0;
     for (;;)
     {
-        const std::function<void(int)> *fn;
-        int begin, end;
+        // Wait for a new work generation. Spin first for low-latency pickup
+        // during a tight solve loop; once kSpinLimit is reached, fall back to a
+        // timed CV sleep so an idle pool does not keep a core busy. The 1 ms
+        // timeout also makes a missed notify cost at most 1 ms (only ever on the
+        // first dispatch after the pool goes idle).
+        int spins = 0;
+        while (w->workGen.load(std::memory_order_acquire) == lastGen)
         {
-            std::unique_lock<std::mutex> lk(w->mutex);
-            w->cv.wait(lk, [w] { return w->hasWork; });
-            if (w->stop)
+            if (w->stop.load(std::memory_order_acquire))
                 return;
-            w->hasWork = false;
-            fn = w->fn;
-            begin = w->begin;
-            end = w->end;
+            if (++spins < kSpinLimit)
+            {
+                cpuRelax();
+            }
+            else
+            {
+                std::unique_lock<std::mutex> lk(w->mutex);
+                w->cv.wait_for(lk, std::chrono::milliseconds(1), [&] {
+                    return w->workGen.load(std::memory_order_acquire) != lastGen ||
+                           w->stop.load(std::memory_order_acquire);
+                });
+            }
         }
+        lastGen = w->workGen.load(std::memory_order_acquire);
+        if (w->stop.load(std::memory_order_acquire))
+            return;
 
+        // fn/begin/end were published before the workGen release above, so the
+        // acquire load makes them visible here.
+        const std::function<void(int)> *fn = w->fn;
+        int begin = w->begin;
+        int end = w->end;
         for (int i = begin; i < end; ++i)
             (*fn)(i);
 
-        // Signal completion last; the calling thread may destroy fn afterwards,
-        // but this worker only touches its own (pool-owned) state from here.
-        {
-            std::lock_guard<std::mutex> lk(w->mutex);
-            w->done = true;
-        }
-        w->cv.notify_one();
+        w->done.store(true, std::memory_order_release);
     }
 }
 
@@ -93,8 +131,8 @@ void ThreadPool::parallelFor(int count, const std::function<void(int)> &fn)
 
     int chunk = (count + lanes - 1) / lanes;
 
-    // Dispatch contiguous chunks to the worker lanes (1 .. workers).
-    int dispatched = 0;
+    // Publish a chunk to each worker lane (1 .. workers). Writing fn/begin/end
+    // before the release fetch_add makes them visible to the worker's acquire.
     for (size_t k = 0; k < workers.size(); ++k)
     {
         Worker *w = workers[k];
@@ -104,16 +142,13 @@ void ThreadPool::parallelFor(int count, const std::function<void(int)> &fn)
             begin = count;
         if (end > count)
             end = count;
-        {
-            std::lock_guard<std::mutex> lk(w->mutex);
-            w->fn = &fn;
-            w->begin = begin;
-            w->end = end;
-            w->hasWork = true;
-            w->done = false;
-        }
-        w->cv.notify_one();
-        ++dispatched;
+
+        w->fn = &fn;
+        w->begin = begin;
+        w->end = end;
+        w->done.store(false, std::memory_order_relaxed);
+        w->workGen.fetch_add(1, std::memory_order_release);
+        w->cv.notify_one(); // only wakes the worker if it had fallen asleep
     }
 
     // The calling thread runs lane 0.
@@ -121,11 +156,16 @@ void ThreadPool::parallelFor(int count, const std::function<void(int)> &fn)
     for (int i = 0; i < mainEnd; ++i)
         fn(i);
 
-    // Wait for every worker lane to finish before fn goes out of scope.
-    for (int k = 0; k < dispatched; ++k)
+    // Spin-wait for every worker lane to finish before fn goes out of scope.
+    for (Worker *w : workers)
     {
-        Worker *w = workers[k];
-        std::unique_lock<std::mutex> lk(w->mutex);
-        w->cv.wait(lk, [w] { return w->done; });
+        int spins = 0;
+        while (!w->done.load(std::memory_order_acquire))
+        {
+            if (++spins < kSpinLimit)
+                cpuRelax();
+            else
+                std::this_thread::yield();
+        }
     }
 }

@@ -15,7 +15,8 @@ bookkeeping (object origin vs. centre of mass, baked scale) in one place.
 """
 
 import bmesh
-from mathutils import Quaternion, Vector
+import numpy as np
+from mathutils import Matrix, Quaternion, Vector
 
 _native = None
 
@@ -287,13 +288,19 @@ def _build_constraints(solver, scene, records):
                              stiff_lin, cs.stiffness_ang, fracture)
 
 
-def _apply_transform(obj, record, com_world, quat_wxyz):
+def _apply_transform(obj, record, com_world, quat_wxyz, apply=True):
+    """Computes one body's object pose. Writes it onto the object when `apply`
+    is set (live preview); a bake skips the write and only keyframes the result.
+    Returns (location, rotation)."""
     rotation = Quaternion(quat_wxyz)
-    if obj.rotation_mode != 'QUATERNION':
-        obj.rotation_mode = 'QUATERNION'
-    obj.rotation_quaternion = rotation
     # Object origin = centre of mass minus the (rotated) local COM offset.
-    obj.location = Vector(com_world) - (rotation @ record.local_com)
+    location = Vector(com_world) - (rotation @ record.local_com)
+    if apply:
+        if obj.rotation_mode != 'QUATERNION':
+            obj.rotation_mode = 'QUATERNION'
+        # One matrix assignment instead of separate location + rotation writes.
+        obj.matrix_basis = Matrix.LocRotScale(location, rotation, obj.scale)
+    return location, rotation
 
 
 def read_body(obj, record):
@@ -302,11 +309,13 @@ def read_body(obj, record):
     _apply_transform(obj, record, com_world, quat_wxyz)
 
 
-def read_active_bodies(scene, records):
-    """Writes every active body's transform back in one batched native call.
+def read_active_bodies(scene, records, apply=True):
+    """Reads every active body's transform back in one batched native call.
 
     Avoids the per-body ctypes overhead that dominates when streaming hundreds
-    of bodies back to Blender each frame. Returns the number of bodies updated.
+    of bodies back to Blender each frame. Returns a list of
+    (object, location, rotation). With apply=False the object transforms are
+    not written (a bake only needs the values to keyframe them).
     """
     items = []
     bodies = []
@@ -317,12 +326,20 @@ def read_active_bodies(scene, records):
         items.append((obj, record))
         bodies.append(record.body)
     if not bodies:
-        return 0
+        return []
 
     transforms = get_native().read_transforms(bodies)
+    applied = []
     for (obj, record), (com_world, quat_wxyz) in zip(items, transforms):
-        _apply_transform(obj, record, com_world, quat_wxyz)
-    return len(bodies)
+        location, rotation = _apply_transform(obj, record, com_world, quat_wxyz, apply)
+        applied.append((obj, location, rotation))
+    return applied
+
+
+# World->local 4x4 applied to an (N, 3) world-space vertex array, vectorised.
+def _to_local(world, world_to_local):
+    m = np.array(world_to_local, dtype=np.float32)  # 4x4 matrix rows
+    return world @ m[:3, :3].T + m[:3, 3]
 
 
 def read_cloths(scene, records):
@@ -333,21 +350,36 @@ def read_cloths(scene, records):
         obj = scene.objects.get(name)
         if obj is None:
             continue
-        positions = record.cloth.vertices()
         mesh = obj.data
-        w2l = record.world_to_local
-        count = min(len(positions), len(mesh.vertices))
-        for i in range(count):
-            mesh.vertices[i].co = w2l @ Vector(positions[i])
+        cloth = record.cloth
+        n = cloth.vertex_count
+        # Fast path: pull the native buffer, transform every vertex with numpy,
+        # and write the mesh in one bulk foreach_set.
+        if n == len(mesh.vertices):
+            world = np.ctypeslib.as_array(cloth.vertices_buffer()).reshape(n, 3)
+            local = _to_local(world, record.world_to_local)
+            mesh.vertices.foreach_set("co", local.reshape(-1))
+        else:
+            w2l = record.world_to_local
+            positions = cloth.vertices()
+            count = min(len(positions), len(mesh.vertices))
+            for i in range(count):
+                mesh.vertices[i].co = w2l @ Vector(positions[i])
         mesh.update()
 
 
 def cloth_local_positions(scene, records):
-    """Returns {object_name: [local-space vertex tuples]} for all cloths."""
+    """Returns {object_name: flat float32 local-space vertex array} for cloths.
+
+    The flat layout lets the bake cache be applied with a single foreach_set.
+    """
     result = {}
     for name, record in records.items():
         if not isinstance(record, ClothRecord):
             continue
-        w2l = record.world_to_local
-        result[name] = [tuple(w2l @ Vector(p)) for p in record.cloth.vertices()]
+        cloth = record.cloth
+        n = cloth.vertex_count
+        world = np.ctypeslib.as_array(cloth.vertices_buffer()).reshape(n, 3)
+        # _to_local returns a fresh array; reshape keeps it alive (buffer reused).
+        result[name] = _to_local(world, record.world_to_local).reshape(-1)
     return result

@@ -111,6 +111,7 @@ struct Rigid : Body
     float3 size; // Full widths in each dimension (AABB extents for a hull body)
     float3 moment;
     ConvexHull *hull; // Convex collision shape; nullptr means an oriented box of `size`
+    float3 worldAxis[3]; // Solver scratch: world-space box axes, cached per step
 
     // Box body: mass properties are derived analytically from `size` and `density`.
     Rigid(Solver *solver, float3 size, float density, float friction, float3 position, float3 velocity = float3{0, 0, 0});
@@ -318,6 +319,35 @@ struct Cloth
     ~Cloth();
 };
 
+// Per-phase wall-clock timing for Solver::step(), accumulated across steps while
+// Solver::profileEnabled is set. A profiling aid (see tests/benchmark.cpp); the
+// timing calls are skipped entirely when profiling is off, so leaving this in
+// has no cost on the normal path.
+struct SolverProfile
+{
+    double broadphaseMs;  // broadphase + contact-force creation
+    double forceGatherMs; // gather forces into an array (serial linked-list walk)
+    double initMs;        // parallel force initialize() + serial delete + wake
+    double warmstartMs;   // body inertial/warmstart pass (parallel)
+    double coloringMs;    // greedy graph colouring (single-threaded)
+    double primalMs;      // primal updates (all colours, all iterations)
+    double dualMs;        // dual updates (all iterations)
+    double otherMs;       // body gather, velocity (BDF1), sleep pass
+    int steps;            // number of steps accumulated
+
+    void reset()
+    {
+        broadphaseMs = forceGatherMs = initMs = warmstartMs = coloringMs = 0.0;
+        primalMs = dualMs = otherMs = 0.0;
+        steps = 0;
+    }
+    double totalMs() const
+    {
+        return broadphaseMs + forceGatherMs + initMs + warmstartMs + coloringMs +
+               primalMs + dualMs + otherMs;
+    }
+};
+
 // Core solver class which holds all the bodies and forces, and has logic to step the simulation forward in time
 struct Solver
 {
@@ -343,6 +373,11 @@ struct Solver
 
     int threads;      // Worker lane count for the solver (0 = hardware concurrency)
     ThreadPool *pool; // Persistent thread pool; rebuilt by setThreads
+
+    // Per-phase profiling. Off by default; when on, step() accumulates phase
+    // timings into `profile`. Call profile.reset() before a measured run.
+    bool profileEnabled;
+    SolverProfile profile;
 
     Solver();
     ~Solver();

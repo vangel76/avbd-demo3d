@@ -63,9 +63,10 @@ inline OBB makeOBB(const Rigid* body)
     box.center = body->positionLin;
     box.rotation = body->positionAng;
     box.half = body->size * 0.5f;
-    box.axis[0] = rotate(body->positionAng, float3{ 1.0f, 0.0f, 0.0f });
-    box.axis[1] = rotate(body->positionAng, float3{ 0.0f, 1.0f, 0.0f });
-    box.axis[2] = rotate(body->positionAng, float3{ 0.0f, 0.0f, 1.0f });
+    // World-space axes are cached on the body once per step (Solver::step).
+    box.axis[0] = body->worldAxis[0];
+    box.axis[1] = body->worldAxis[1];
+    box.axis[2] = body->worldAxis[2];
     return box;
 }
 

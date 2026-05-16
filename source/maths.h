@@ -159,6 +159,13 @@ inline float3 operator/(float3 a, float b)
     return {a.x / b, a.y / b, a.z / b};
 }
 
+// Component-wise (Hadamard) product. Bit-identical to diagonal(b) * a but
+// without building the matrix -- used in the contact solver hot loop.
+inline float3 cwiseMul(float3 a, float3 b)
+{
+    return {a.x * b.x, a.y * b.y, a.z * b.z};
+}
+
 inline float3 operator*(float3x3 a, float3 b)
 {
     return {dot(a[0], b), dot(a[1], b), dot(a[2], b)};
@@ -426,6 +433,14 @@ inline float3x3 diagonal(float m00, float m11, float m22)
         m00, 0, 0,
         0, m11, 0,
         0, 0, m22};
+}
+
+// m * diagonal(k): scales column j of m by k[j]. Bit-identical to the full
+// matrix product m * diagonal(k.x, k.y, k.z) but skips the zero terms -- used
+// to stamp the diagonal penalty stiffness into the contact Hessian.
+inline float3x3 scaleCols(float3x3 m, float3 k)
+{
+    return {cwiseMul(m[0], k), cwiseMul(m[1], k), cwiseMul(m[2], k)};
 }
 
 inline quat conjugate(quat q)
