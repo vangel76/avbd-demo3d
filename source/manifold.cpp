@@ -27,6 +27,9 @@ int Manifold::collide(Rigid *bodyA, Rigid *bodyB, Contact *contacts, float3x3 &b
 
 bool Manifold::initialize()
 {
+    Rigid* bodyA = (Rigid*)bodies[0];
+    Rigid* bodyB = (Rigid*)bodies[1];
+
     // Compute friction
     friction = sqrtf(bodyA->friction * bodyB->friction);
 
@@ -78,8 +81,11 @@ bool Manifold::initialize()
     return numContacts > 0;
 }
 
-void Manifold::updatePrimal(Rigid *body, float alpha, float3x3 &lhsLin, float3x3 &lhsAng, float3x3 &lhsCross, float3 &rhsLin, float3 &rhsAng)
+void Manifold::updatePrimal(Body *body, float alpha, float3x3 &lhsLin, float3x3 &lhsAng, float3x3 &lhsCross, float3 &rhsLin, float3 &rhsAng)
 {
+    Rigid *bodyA = (Rigid *)bodies[0];
+    Rigid *bodyB = (Rigid *)bodies[1];
+
     float3 dqALin = bodyA->positionLin - bodyA->initialLin;
     float3 dqAAng = bodyA->positionAng - bodyA->initialAng;
     float3 dqBLin = bodyB->positionLin - bodyB->initialLin;
@@ -150,6 +156,9 @@ void Manifold::updatePrimal(Rigid *body, float alpha, float3x3 &lhsLin, float3x3
 
 void Manifold::updateDual(float alpha)
 {
+    Rigid *bodyA = (Rigid *)bodies[0];
+    Rigid *bodyB = (Rigid *)bodies[1];
+
     float3 dqALin = bodyA->positionLin - bodyA->initialLin;
     float3 dqAAng = bodyA->positionAng - bodyA->initialAng;
     float3 dqBLin = bodyB->positionLin - bodyB->initialLin;

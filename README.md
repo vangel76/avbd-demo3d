@@ -83,7 +83,10 @@ solver, supporting convex-hull and box colliders, joints, and springs.
   builds a staggered brick wall (~a few hundred bodies) on solid ground for
   quick experimentation.
 - **Bodies**: select a mesh, open *Properties > Physics > AVBD Rigid Body*,
-  enable it, and choose Active/Passive, a collision shape, density, and friction.
+  enable it, and choose Active/Passive/Cloth. Active/Passive use a collision
+  shape, density, and friction; **Cloth** simulates the mesh as triangle-FEM
+  cloth (Young's modulus, Poisson ratio, bend stiffness, thickness, and an
+  optional pinned vertex group).
 - **Constraints**: select two bodies, then use *View3D > Sidebar > AVBD > Add
   Joint / Add Spring*. The created Empty marks the anchor point.
 - **Solver settings**: *Properties > Scene > AVBD Physics* (gravity, timestep,

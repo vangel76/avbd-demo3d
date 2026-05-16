@@ -111,6 +111,20 @@ try:
     _body_is_asleep = _sig("avbd_body_is_asleep", _i, [_void_p])
 except AttributeError:
     _body_is_asleep = None
+
+# Cloth API: present only in builds with triangle-FEM cloth support.
+try:
+    _add_cloth = _sig(
+        "avbd_add_cloth", _void_p,
+        [_void_p, ctypes.POINTER(_f), _i, ctypes.POINTER(_i), _i,
+         _f, _f, _f, _f, _f, _f, _f])
+    _cloth_vertex_count = _sig("avbd_cloth_vertex_count", _i, [_void_p])
+    _cloth_get_vertices = _sig("avbd_cloth_get_vertices", None, [_void_p, ctypes.POINTER(_f)])
+    _cloth_pin_vertex = _sig("avbd_cloth_pin_vertex", None, [_void_p, _i])
+    _cloth_destroy = _sig("avbd_cloth_destroy", None, [_void_p])
+    HAS_CLOTH = True
+except AttributeError:
+    HAS_CLOTH = False
 _solver_set_params = _sig(
     "avbd_solver_set_params", None, [_void_p, _f, _f, _i, _f, _f, _f, _f]
 )
@@ -257,6 +271,32 @@ class Force:
         return bool(_joint_is_broken(self._handle))
 
 
+class Cloth:
+    """A triangle-FEM cloth handle. Created via Solver.add_cloth."""
+
+    __slots__ = ("_handle", "vertex_count", "_buf")
+
+    def __init__(self, handle, vertex_count):
+        self._handle = handle
+        self.vertex_count = vertex_count
+        self._buf = (_f * (vertex_count * 3))()
+
+    def pin(self, index):
+        """Pins a cloth vertex in place (makes it static)."""
+        _cloth_pin_vertex(self._handle, index)
+
+    def vertices(self):
+        """Returns the current cloth vertex positions as a list of (x, y, z)."""
+        _cloth_get_vertices(self._handle, self._buf)
+        b = self._buf
+        return [(b[i * 3], b[i * 3 + 1], b[i * 3 + 2]) for i in range(self.vertex_count)]
+
+    def destroy(self):
+        if self._handle:
+            _cloth_destroy(self._handle)
+            self._handle = None
+
+
 class Solver:
     """An AVBD physics world."""
 
@@ -264,6 +304,7 @@ class Solver:
         self._handle = _solver_create()
         if not self._handle:
             raise RuntimeError("avbd_solver_create failed")
+        self._cloths = []
         if threads:
             self.set_threads(threads)
 
@@ -274,6 +315,9 @@ class Solver:
         self.destroy()
 
     def destroy(self):
+        for cloth in self._cloths:
+            cloth.destroy()
+        self._cloths = []
         if self._handle:
             _solver_destroy(self._handle)
             self._handle = None
@@ -354,3 +398,30 @@ class Solver:
     def add_ignore_collision(self, body_a, body_b):
         handle = _add_ignore(self._handle, body_a._handle, body_b._handle)
         return Force(handle)
+
+    def add_cloth(self, verts, triangles, density=1.0, thickness=0.01,
+                  youngs_modulus=1000.0, poisson=0.3, bend_stiffness=0.5,
+                  particle_radius=0.02, friction=0.5):
+        """Adds a triangle-FEM cloth.
+
+        verts: sequence of (x, y, z). triangles: sequence of (i, j, k).
+        """
+        if not HAS_CLOTH:
+            raise RuntimeError("the loaded avbd library has no cloth support; "
+                               "rebuild and reinstall it")
+        flat_v = []
+        for v in verts:
+            flat_v.extend(v)
+        flat_t = []
+        for t in triangles:
+            flat_t.extend(t)
+        verts_arr = (_f * len(flat_v))(*flat_v)
+        tris_arr = (_i * len(flat_t))(*flat_t)
+        handle = _add_cloth(self._handle, verts_arr, len(verts), tris_arr, len(triangles),
+                            density, thickness, youngs_modulus, poisson,
+                            bend_stiffness, particle_radius, friction)
+        if not handle:
+            raise ValueError("avbd_add_cloth failed")
+        cloth = Cloth(handle, len(verts))
+        self._cloths.append(cloth)
+        return cloth

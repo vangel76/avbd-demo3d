@@ -13,13 +13,14 @@
 #include <cfloat>
 
 Rigid::Rigid(Solver* solver, float3 size, float density, float friction, float3 position, float3 velocity)
-    : solver(solver), forces(0), next(0), positionLin(position), positionAng({ 0, 0, 0, 1 }),
-    velocityLin(velocity), velocityAng({ 0, 0, 0 }), prevVelocityLin(velocity), size(size), friction(friction), hull(0),
-    asleep(false), sleepTimer(0.0f)
+    : Body(BODY_RIGID, solver),
+    positionAng{ 0, 0, 0, 1 }, initialAng{ 0, 0, 0, 1 }, inertialAng{ 0, 0, 0, 1 },
+    velocityAng{ 0, 0, 0 }, size(size), hull(0)
 {
-    // Add to linked list
-    next = solver->bodies;
-    solver->bodies = this;
+    positionLin = position;
+    velocityLin = velocity;
+    prevVelocityLin = velocity;
+    this->friction = friction;
 
     // Compute mass properties and bounding radius
     mass = size.x * size.y * size.z * density;
@@ -32,13 +33,14 @@ Rigid::Rigid(Solver* solver, float3 size, float density, float friction, float3 
 }
 
 Rigid::Rigid(Solver* solver, ConvexHull* hull, float density, float friction, float3 position, float3 velocity)
-    : solver(solver), forces(0), next(0), positionLin(position), positionAng({ 0, 0, 0, 1 }),
-    velocityLin(velocity), velocityAng({ 0, 0, 0 }), prevVelocityLin(velocity), friction(friction), hull(hull),
-    asleep(false), sleepTimer(0.0f)
+    : Body(BODY_RIGID, solver),
+    positionAng{ 0, 0, 0, 1 }, initialAng{ 0, 0, 0, 1 }, inertialAng{ 0, 0, 0, 1 },
+    velocityAng{ 0, 0, 0 }, size{ 0, 0, 0 }, hull(hull)
 {
-    // Add to linked list
-    next = solver->bodies;
-    solver->bodies = this;
+    positionLin = position;
+    velocityLin = velocity;
+    prevVelocityLin = velocity;
+    this->friction = friction;
 
     // Integrate mass properties over the polyhedron, then shift the hull so its
     // centre of mass sits at the body origin (AVBD tracks the centre of mass).
@@ -64,21 +66,7 @@ Rigid::Rigid(Solver* solver, ConvexHull* hull, float density, float friction, fl
 
 Rigid::~Rigid()
 {
-    // Free the collision hull (null for box bodies)
+    // Free the collision hull (null for box bodies). The Body destructor removes
+    // this body from the solver list.
     delete hull;
-
-    // Remove from linked list
-    Rigid** p = &solver->bodies;
-    while (*p != this)
-        p = &(*p)->next;
-    *p = next;
-}
-
-bool Rigid::constrainedTo(Rigid* other) const
-{
-    // Check if this body is constrained to the other body
-    for (Force* f = forces; f != 0; f = f->next)
-        if ((f->bodyA == this && f->bodyB == other) || (f->bodyA == other && f->bodyB == this))
-            return true;
-    return false;
 }

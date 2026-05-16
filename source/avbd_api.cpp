@@ -21,6 +21,7 @@ namespace
 inline Solver *S(AvbdSolver *h) { return reinterpret_cast<Solver *>(h); }
 inline Rigid *B(AvbdBody *h) { return reinterpret_cast<Rigid *>(h); }
 inline Force *F(AvbdForce *h) { return reinterpret_cast<Force *>(h); }
+inline Cloth *CL(AvbdCloth *h) { return reinterpret_cast<Cloth *>(h); }
 inline float3 V3(const float *p) { return float3{p[0], p[1], p[2]}; }
 } // namespace
 
@@ -207,6 +208,46 @@ extern "C"
     int avbd_body_is_asleep(AvbdBody *body)
     {
         return B(body)->asleep ? 1 : 0;
+    }
+
+    AvbdCloth *avbd_add_cloth(AvbdSolver *solver, const float *verts, int numVerts,
+                              const int *triangles, int numTriangles,
+                              float density, float thickness, float youngsModulus,
+                              float poisson, float bendStiffness, float particleRadius,
+                              float friction)
+    {
+        Cloth *cloth = new Cloth(S(solver), reinterpret_cast<const float3 *>(verts), numVerts,
+                                 triangles, numTriangles, density, thickness, youngsModulus,
+                                 poisson, bendStiffness, particleRadius, friction);
+        return reinterpret_cast<AvbdCloth *>(cloth);
+    }
+
+    int avbd_cloth_vertex_count(AvbdCloth *cloth)
+    {
+        return CL(cloth)->numParticles;
+    }
+
+    void avbd_cloth_get_vertices(AvbdCloth *cloth, float *out)
+    {
+        Cloth *c = CL(cloth);
+        for (int i = 0; i < c->numParticles; ++i)
+        {
+            out[i * 3 + 0] = c->particles[i]->positionLin.x;
+            out[i * 3 + 1] = c->particles[i]->positionLin.y;
+            out[i * 3 + 2] = c->particles[i]->positionLin.z;
+        }
+    }
+
+    void avbd_cloth_pin_vertex(AvbdCloth *cloth, int index)
+    {
+        Cloth *c = CL(cloth);
+        if (index >= 0 && index < c->numParticles)
+            c->particles[index]->mass = 0.0f;
+    }
+
+    void avbd_cloth_destroy(AvbdCloth *cloth)
+    {
+        delete CL(cloth);
     }
 
 } // extern "C"

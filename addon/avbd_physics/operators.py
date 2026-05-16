@@ -13,6 +13,7 @@ import time
 
 import bmesh
 import bpy
+from bpy.app.handlers import persistent
 from bpy.props import IntProperty, StringProperty
 
 from . import simulation
@@ -53,6 +54,32 @@ def _remove_baked_keyframes(obj):
     return removed
 
 
+# Session cloth cache: object name -> {frame: [local-space vertex tuples]}.
+# Applied by a frame-change handler. Cloth deformation cannot be keyframed per
+# vertex practically, so it is cached here. The cache is not saved with the
+# .blend file; re-bake after reloading.
+_cloth_cache = {}
+
+
+@persistent
+def apply_cloth_cache(scene, depsgraph=None):
+    """frame_change_post handler: applies cached cloth vertices for the frame.
+
+    Marked persistent so it survives .blend loads."""
+    for name, frames in _cloth_cache.items():
+        verts = frames.get(scene.frame_current)
+        if verts is None:
+            continue
+        obj = scene.objects.get(name)
+        if obj is None:
+            continue
+        mesh = obj.data
+        count = min(len(verts), len(mesh.vertices))
+        for i in range(count):
+            mesh.vertices[i].co = verts[i]
+        mesh.update()
+
+
 class AVBD_OT_bake(bpy.types.Operator):
     """Run the AVBD simulation and bake the result to keyframes"""
 
@@ -86,15 +113,24 @@ class AVBD_OT_bake(bpy.types.Operator):
                 if obj is not None and obj.avbd_body.body_type == 'ACTIVE':
                     _keyframe(obj, frame)
 
-        # Keyframe the initial pose of every active body at the start frame.
+        def cache_cloth(frame):
+            for name, verts in simulation.cloth_local_positions(scene, records).items():
+                _cloth_cache.setdefault(name, {})[frame] = verts
+
+        # Fresh cloth cache for this bake.
+        _cloth_cache.clear()
+
+        # Capture the initial pose of every active body and cloth at f0.
         simulation.read_active_bodies(scene, records)
         keyframe_active(f0)
+        cache_cloth(f0)
 
         for frame in range(f0 + 1, f1 + 1):
             for _ in range(settings.substeps):
                 solver.step()
             simulation.read_active_bodies(scene, records)
             keyframe_active(frame)
+            cache_cloth(frame)
             window.progress_update(frame)
 
             # Show baking progress in the viewport every 10 frames. redraw_timer
@@ -126,6 +162,7 @@ class AVBD_OT_clear_bake(bpy.types.Operator):
         for obj in simulation.iter_bodies(context.scene):
             if _remove_baked_keyframes(obj):
                 cleared += 1
+        _cloth_cache.clear()
         self.report({'INFO'}, "Cleared baked keyframes from {} bodies".format(cleared))
         return {'FINISHED'}
 
@@ -140,6 +177,7 @@ class AVBD_OT_live_preview(bpy.types.Operator):
     _solver = None
     _records = None
     _saved = None
+    _saved_cloths = None
     _ticks = 0
     _solve_ms = 0.0
     _wall_start = 0.0
@@ -156,6 +194,7 @@ class AVBD_OT_live_preview(bpy.types.Operator):
             for _ in range(settings.substeps):
                 self._solver.step()
             simulation.read_active_bodies(context.scene, self._records)
+            simulation.read_cloths(context.scene, self._records)
             self._solve_ms += (time.perf_counter() - t0) * 1000.0
             self._ticks += 1
             for area in context.screen.areas:
@@ -184,9 +223,14 @@ class AVBD_OT_live_preview(bpy.types.Operator):
         # quaternion mode, and a later rotation_mode change would otherwise
         # convert (and discard) the rotation.
         self._saved = {}
+        self._saved_cloths = {}
         for name in self._records:
             obj = context.scene.objects.get(name)
-            if obj is not None:
+            if obj is None:
+                continue
+            if obj.avbd_body.body_type == 'CLOTH':
+                self._saved_cloths[name] = [v.co.copy() for v in obj.data.vertices]
+            else:
                 self._saved[name] = (obj.rotation_mode, obj.matrix_basis.copy())
 
         window = context.window_manager
@@ -230,7 +274,18 @@ class AVBD_OT_live_preview(bpy.types.Operator):
                     continue
                 obj.rotation_mode = mode
                 obj.matrix_basis = matrix
+        # Restore the pre-preview cloth meshes.
+        if self._saved_cloths:
+            for name, coords in self._saved_cloths.items():
+                obj = context.scene.objects.get(name)
+                if obj is None:
+                    continue
+                mesh = obj.data
+                for i in range(min(len(coords), len(mesh.vertices))):
+                    mesh.vertices[i].co = coords[i]
+                mesh.update()
         self._records = None
+        self._saved_cloths = None
         window.avbd_live_running = False
 
 
@@ -355,6 +410,66 @@ class AVBD_OT_make_test_scene(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class AVBD_OT_make_cloth_scene(bpy.types.Operator):
+    """Build a cloth sheet draping over a box for quick cloth testing"""
+
+    bl_idname = "avbd.make_cloth_scene"
+    bl_label = "Create Cloth Drape Test Scene"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    resolution: IntProperty(
+        name="Cloth Resolution", default=20, min=4, max=100,
+        description="Grid subdivisions of the cloth sheet")
+
+    def execute(self, context):
+        cube = _unit_cube_mesh()
+        collection = bpy.data.collections.new("AVBD Cloth Scene")
+        context.scene.collection.children.link(collection)
+
+        def add_box(name, scale, location, body_type):
+            obj = bpy.data.objects.new(name, cube)
+            obj.scale = scale
+            obj.location = location
+            collection.objects.link(obj)
+            b = obj.avbd_body
+            b.enabled = True
+            b.body_type = body_type
+            b.collision_shape = 'BOX'
+            b.friction = 0.5
+            return obj
+
+        # Solid passive ground (top surface at z = 0.25) and a box obstacle.
+        add_box("AVBD_Ground", (8.0, 8.0, 0.5), (0, 0, 0), 'PASSIVE')
+        add_box("AVBD_Obstacle", (1.5, 1.5, 1.5), (0, 0, 1.0), 'PASSIVE')
+
+        # Cloth sheet hovering above, which falls and drapes over the obstacle.
+        bpy.ops.mesh.primitive_grid_add(
+            x_subdivisions=self.resolution, y_subdivisions=self.resolution,
+            size=4.0, location=(0, 0, 3.0))
+        cloth = context.active_object
+        for c in list(cloth.users_collection):
+            c.objects.unlink(cloth)
+        collection.objects.link(cloth)
+        cloth.name = "AVBD_Cloth"
+
+        b = cloth.avbd_body
+        b.enabled = True
+        b.body_type = 'CLOTH'
+        b.density = 1.0
+        b.friction = 0.5
+        b.cloth_youngs = 2000.0
+        b.cloth_poisson = 0.3
+        b.cloth_bend = 0.3
+        b.cloth_thickness = 0.02
+
+        settings = context.scene.avbd
+        settings.frame_start = 1
+        settings.frame_end = 150
+
+        self.report({'INFO'}, "Created cloth drape scene")
+        return {'FINISHED'}
+
+
 _CLASSES = (
     AVBD_OT_bake,
     AVBD_OT_clear_bake,
@@ -362,6 +477,7 @@ _CLASSES = (
     AVBD_OT_stop_live_preview,
     AVBD_OT_add_constraint,
     AVBD_OT_make_test_scene,
+    AVBD_OT_make_cloth_scene,
 )
 
 

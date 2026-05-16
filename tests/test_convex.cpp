@@ -162,6 +162,24 @@ static void testBrickWall()
     check(true, "brick wall stays standing", fallenPct, 0.0f, 2.0f);
 }
 
+// Spring as an AVBD force: a block hung from a fixed anchor settles at the
+// expected equilibrium stretch (penalty ramps to the material stiffness).
+static void testSpring()
+{
+    Solver solver;
+    solver.sleepEnabled = false; // keep solving so equilibrium is exact
+    Rigid *anchor = new Rigid(&solver, float3{1, 1, 1}, 0.0f, 0.5f, float3{0, 0, 10});
+    Rigid *block = new Rigid(&solver, float3{1, 1, 1}, 1.0f, 0.5f, float3{0, 0, 8});
+    new Spring(&solver, anchor, block, float3{0, 0, 0}, float3{0, 0, 0}, 1000.0f, 2.0f);
+
+    for (int i = 0; i < 400; ++i)
+        solver.step();
+
+    // Equilibrium stretch C = m*g/k = (1 * 10) / 1000 = 0.01, so the block
+    // hangs at anchorZ - rest - C = 10 - 2 - 0.01.
+    check(true, "spring holds block at equilibrium", block->positionLin.z, 7.99f, 0.03f);
+}
+
 // Body sleeping: a settled body freezes, stays frozen, and wakes on impact.
 static void testSleeping()
 {
@@ -191,6 +209,84 @@ static void testSleeping()
     check(woke, "sleeping box wakes on impact", woke ? 1.0f : 0.0f, 1.0f, 0.5f);
 }
 
+// Triangle-FEM cloth: a grid pinned at two corners hangs and stays stable.
+static void testCloth()
+{
+    Solver solver;
+    solver.sleepEnabled = false;
+    const int N = 6;
+    const float spacing = 0.2f;
+
+    std::vector<float3> verts;
+    for (int y = 0; y < N; ++y)
+        for (int x = 0; x < N; ++x)
+            verts.push_back(float3{x * spacing, y * spacing, 5.0f});
+
+    std::vector<int> tris;
+    for (int y = 0; y < N - 1; ++y)
+        for (int x = 0; x < N - 1; ++x)
+        {
+            int i = y * N + x;
+            tris.push_back(i);     tris.push_back(i + 1);     tris.push_back(i + N);
+            tris.push_back(i + 1); tris.push_back(i + N + 1); tris.push_back(i + N);
+        }
+
+    Cloth cloth(&solver, verts.data(), (int)verts.size(), tris.data(), (int)tris.size() / 3,
+                1.0f, 0.01f, 1000.0f, 0.3f, 0.5f, 0.05f, 0.5f);
+
+    // Pin the two top corners by making those particles static.
+    cloth.particles[(N - 1) * N + 0]->mass = 0.0f;
+    cloth.particles[(N - 1) * N + (N - 1)]->mass = 0.0f;
+
+    for (int i = 0; i < 300; ++i)
+        solver.step();
+
+    float centreZ = cloth.particles[(N / 2) * N + N / 2]->positionLin.z;
+    bool stable = isfinite(centreZ) && centreZ < 4.95f && centreZ > -2.0f;
+    check(stable, "cloth hangs and stays stable", centreZ < 5.0f ? 1.0f : 0.0f, 1.0f, 0.5f);
+    check(true, "cloth pin held", cloth.particles[(N - 1) * N]->positionLin.z, 5.0f, 1.0e-4f);
+}
+
+// Builds an N x N triangle-grid cloth at height z, spacing s.
+static Cloth *makeGridCloth(Solver &solver, int N, float s, float z,
+                            std::vector<float3> &verts, std::vector<int> &tris)
+{
+    verts.clear();
+    tris.clear();
+    for (int y = 0; y < N; ++y)
+        for (int x = 0; x < N; ++x)
+            verts.push_back(float3{x * s - (N - 1) * s * 0.5f, y * s - (N - 1) * s * 0.5f, z});
+    for (int y = 0; y < N - 1; ++y)
+        for (int x = 0; x < N - 1; ++x)
+        {
+            int i = y * N + x;
+            tris.push_back(i);     tris.push_back(i + 1);     tris.push_back(i + N);
+            tris.push_back(i + 1); tris.push_back(i + N + 1); tris.push_back(i + N);
+        }
+    return new Cloth(&solver, verts.data(), (int)verts.size(), tris.data(), (int)tris.size() / 3,
+                     1.0f, 0.01f, 1000.0f, 0.3f, 0.5f, 0.05f, 0.5f);
+}
+
+// Cloth drapes onto a static ground box instead of tunnelling through it.
+static void testClothDrape()
+{
+    Solver solver;
+    solver.sleepEnabled = false;
+    new Rigid(&solver, float3{10, 10, 1}, 0.0f, 0.5f, float3{0, 0, 0}); // ground, top z=0.5
+
+    std::vector<float3> verts;
+    std::vector<int> tris;
+    Cloth *cloth = makeGridCloth(solver, 6, 0.2f, 3.0f, verts, tris);
+
+    for (int i = 0; i < 400; ++i)
+        solver.step();
+
+    float centreZ = cloth->particles[(6 / 2) * 6 + 6 / 2]->positionLin.z;
+    bool onGround = isfinite(centreZ) && centreZ > 0.3f && centreZ < 1.0f;
+    check(onGround, "cloth drapes on ground (no tunnelling)", onGround ? 1.0f : 0.0f, 1.0f, 0.5f);
+    delete cloth;
+}
+
 int main()
 {
     testHullMassProperties();
@@ -200,7 +296,10 @@ int main()
     testThreadDeterminism();
     testTallStack();
     testBrickWall();
+    testSpring();
     testSleeping();
+    testCloth();
+    testClothDrape();
 
     printf("\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
            failures, failures == 1 ? "" : "s");

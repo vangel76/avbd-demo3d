@@ -22,8 +22,11 @@
 #define COLLISION_MARGIN 0.01f     // Margin for collision detection to avoid flickering contacts
 #define STICK_THRESH 0.00001f      // Position threshold for sticking contacts (ie static friction)
 #define SHOW_CONTACTS true         // Whether to show contacts in the debug draw
+#define MAX_FORCE_BODIES 4         // Maximum number of bodies a single force element connects
 
+struct Body;
 struct Rigid;
+struct Particle;
 struct Force;
 struct Manifold;
 struct Solver;
@@ -63,31 +66,51 @@ struct ConvexHull
 void computeHullMassProperties(const ConvexHull *hull, float density,
                                float &massOut, float3 &comOut, float3 &momentOut);
 
-// Holds all the state for a single rigid body that is needed by AVBD
-struct Rigid
+// Distinguishes the two degree-of-freedom kinds the solver supports.
+enum BodyKind
 {
+    BODY_RIGID,   // 6-DOF rigid body (linear + angular)
+    BODY_PARTICLE // 3-DOF point mass (cloth / soft-body vertex)
+};
+
+// Base for any simulated body. Holds the linear degrees of freedom and solver
+// bookkeeping shared by 6-DOF rigid bodies and 3-DOF particles.
+struct Body
+{
+    BodyKind kind;
     Solver *solver;
-    Force *forces;
-    Rigid *next;
+    Force *forces; // head of this body's force list (threaded via Force::bodyNext)
+    Body *next;    // solver body list
     float3 positionLin;
-    quat positionAng;
     float3 initialLin;
-    quat initialAng;
     float3 inertialLin;
-    quat inertialAng;
     float3 velocityLin;
-    float3 velocityAng;
     float3 prevVelocityLin;
-    float3 size; // Full widths in each dimension (AABB extents for a hull body)
     float mass;
-    float3 moment;
-    float friction;
-    float radius;
-    ConvexHull *hull; // Convex collision shape; nullptr means an oriented box of `size`
+    float radius;     // bounding / collision sphere radius
+    float friction;   // Coulomb friction coefficient
     int index;        // Solver scratch: position in the per-step body array
     int color;        // Solver scratch: graph-colouring group (-1 for static bodies)
     bool asleep;      // Sleeping bodies are frozen and skipped by the solver until disturbed
     float sleepTimer; // Seconds spent continuously below the rest velocity threshold
+
+    Body(BodyKind kind, Solver *solver);
+    virtual ~Body();
+
+    // True if this body shares any force with `other`.
+    bool constrainedTo(const Body *other) const;
+};
+
+// A 6-DOF rigid body: the linear DOF of Body plus orientation and angular motion.
+struct Rigid : Body
+{
+    quat positionAng;
+    quat initialAng;
+    quat inertialAng;
+    float3 velocityAng;
+    float3 size; // Full widths in each dimension (AABB extents for a hull body)
+    float3 moment;
+    ConvexHull *hull; // Convex collision shape; nullptr means an oriented box of `size`
 
     // Box body: mass properties are derived analytically from `size` and `density`.
     Rigid(Solver *solver, float3 size, float density, float friction, float3 position, float3 velocity = float3{0, 0, 0});
@@ -96,26 +119,38 @@ struct Rigid
     // are integrated over the polyhedron; `position` is the world centre of mass.
     Rigid(Solver *solver, ConvexHull *hull, float density, float friction, float3 position, float3 velocity = float3{0, 0, 0});
 
-    ~Rigid();
-
-    bool constrainedTo(Rigid *other) const;
+    ~Rigid() override;
 };
 
-// Holds all user defined and derived constraint parameters, and provides a common interface for all forces.
+// A 3-DOF point mass used for cloth and soft-body vertices.
+struct Particle : Body
+{
+    Particle(Solver *solver, float3 position, float mass, float radius, float friction = 0.5f);
+};
+
+// Holds all user defined and derived constraint parameters, and provides a common
+// interface for all forces. A force connects up to MAX_FORCE_BODIES bodies.
 struct Force
 {
     Solver *solver;
-    Rigid *bodyA;
-    Rigid *bodyB;
-    Force *nextA;
-    Force *nextB;
-    Force *next;
+    Body *bodies[MAX_FORCE_BODIES];   // connected bodies (first numBodies are valid)
+    Force *bodyNext[MAX_FORCE_BODIES]; // per-body force-list links
+    int numBodies;
+    Force *next; // solver force list
 
-    Force(Solver *solver, Rigid *bodyA, Rigid *bodyB);
+    Force(Solver *solver, Body *bodyA, Body *bodyB);
+    Force(Solver *solver, Body *bodyA, Body *bodyB, Body *bodyC);
+    Force(Solver *solver, Body *bodyA, Body *bodyB, Body *bodyC, Body *bodyD);
     virtual ~Force();
 
+    // Index of `body` within bodies[], or -1 if not connected.
+    int slotOf(const Body *body) const;
+
+    // Threads this force into the solver and per-body linked lists.
+    void linkLists();
+
     virtual bool initialize() = 0;
-    virtual void updatePrimal(Rigid *body, float alpha, float3x3 &lhsLin, float3x3 &lhsAng, float3x3 &lhsCross, float3 &rhsLin, float3 &rhsAng) = 0;
+    virtual void updatePrimal(Body *body, float alpha, float3x3 &lhsLin, float3x3 &lhsAng, float3x3 &lhsCross, float3 &rhsLin, float3 &rhsAng) = 0;
     virtual void updateDual(float alpha) = 0;
 };
 
@@ -133,21 +168,24 @@ struct Joint : Force
     Joint(Solver *solver, Rigid *bodyA, Rigid *bodyB, float3 rA, float3 rB, float stiffnessLin = INFINITY, float stiffnessAng = 0.0f, float fracture = INFINITY);
 
     bool initialize() override;
-    void updatePrimal(Rigid *body, float alpha, float3x3 &lhsLin, float3x3 &lhsAng, float3x3 &lhsCross, float3 &rhsLin, float3 &rhsAng) override;
+    void updatePrimal(Body *body, float alpha, float3x3 &lhsLin, float3x3 &lhsAng, float3x3 &lhsCross, float3 &rhsLin, float3 &rhsAng) override;
     void updateDual(float alpha) override;
 };
 
-// Standard spring force
+// Spring force, modelled as an AVBD finite-stiffness force: the penalty
+// stiffness ramps up to the material stiffness over iterations (Eq. 16), which
+// is what lets VBD converge with high stiffness ratios (paper Sec. 3.4).
 struct Spring : Force
 {
     float3 rA, rB;
     float rest;
-    float stiffness;
+    float stiffness; // material (target) stiffness
+    float penalty;   // ramped penalty stiffness used by the solver
 
     Spring(Solver *solver, Rigid *bodyA, Rigid *bodyB, float3 rA, float3 rB, float stiffness, float rest = -1);
 
-    bool initialize() override { return true; }
-    void updatePrimal(Rigid *body, float alpha, float3x3 &lhsLin, float3x3 &lhsAng, float3x3 &lhsCross, float3 &rhsLin, float3 &rhsAng) override;
+    bool initialize() override;
+    void updatePrimal(Body *body, float alpha, float3x3 &lhsLin, float3x3 &lhsAng, float3x3 &lhsCross, float3 &rhsLin, float3 &rhsAng) override;
     void updateDual(float alpha) override;
 };
 
@@ -158,7 +196,7 @@ struct IgnoreCollision : Force
         : Force(solver, bodyA, bodyB) {}
 
     bool initialize() override { return true; }
-    void updatePrimal(Rigid *body, float alpha, float3x3 &lhsLin, float3x3 &lhsAng, float3x3 &lhsCross, float3 &rhsLin, float3 &rhsAng) override {}
+    void updatePrimal(Body *body, float alpha, float3x3 &lhsLin, float3x3 &lhsAng, float3x3 &lhsCross, float3 &rhsLin, float3 &rhsAng) override {}
     void updateDual(float alpha) override {}
 };
 
@@ -199,7 +237,7 @@ struct Manifold : Force
     Manifold(Solver *solver, Rigid *bodyA, Rigid *bodyB);
 
     bool initialize() override;
-    void updatePrimal(Rigid *body, float alpha, float3x3 &lhsLin, float3x3 &lhsAng, float3x3 &lhsCross, float3 &rhsLin, float3 &rhsAng) override;
+    void updatePrimal(Body *body, float alpha, float3x3 &lhsLin, float3x3 &lhsAng, float3x3 &lhsCross, float3 &rhsLin, float3 &rhsAng) override;
     void updateDual(float alpha) override;
 
     static int collide(Rigid *bodyA, Rigid *bodyB, Contact *contacts, float3x3 &basis);
@@ -210,7 +248,77 @@ struct Manifold : Force
 int collideOBB(Rigid *bodyA, Rigid *bodyB, Manifold::Contact *contacts, float3x3 &basis);
 int collideConvex(Rigid *bodyA, Rigid *bodyB, Manifold::Contact *contacts, float3x3 &basis);
 
-// Core solver class which holds all the rigid bodies and forces, and has logic to step the simulation forward in time
+// Triangle membrane element: a St-Venant-Kirchhoff continuum-mechanics energy
+// over the 2D in-plane strain of a triangle of 3 particles. Resists stretch and
+// shear automatically; bending is handled separately by BendEdge.
+struct FEMTriangle : Force
+{
+    float2x2 dmInv;  // inverse rest shape matrix
+    float2 grad[3];  // shape-function gradients (per triangle vertex)
+    float restArea;
+    float mu;     // Lame shear modulus
+    float lambda; // Lame first parameter
+
+    FEMTriangle(Solver *solver, Particle *p0, Particle *p1, Particle *p2, float mu, float lambda);
+
+    bool initialize() override { return true; }
+    void updatePrimal(Body *body, float alpha, float3x3 &lhsLin, float3x3 &lhsAng, float3x3 &lhsCross, float3 &rhsLin, float3 &rhsAng) override;
+    void updateDual(float alpha) override {}
+};
+
+// Bending element across an interior cloth edge: a quadratic energy on the four
+// vertices (the shared edge + the two opposite vertices) that is zero in the
+// rest configuration and resists folding of the hinge.
+struct BendEdge : Force
+{
+    float3 rest;     // rest value of the bending stencil (x2 + x3 - x0 - x1)
+    float stiffness; // bending stiffness
+
+    BendEdge(Solver *solver, Particle *p0, Particle *p1, Particle *p2, Particle *p3, float stiffness);
+
+    bool initialize() override { return true; }
+    void updatePrimal(Body *body, float alpha, float3x3 &lhsLin, float3x3 &lhsAng, float3x3 &lhsCross, float3 &rhsLin, float3 &rhsAng) override;
+    void updateDual(float alpha) override {}
+};
+
+// Frictional contact between a particle and a rigid body. The rigid is treated
+// as its oriented bounding box for the closest-point query (exact for box
+// bodies, an approximation for convex hulls). Augmented-Lagrangian like Manifold.
+struct ParticleContact : Force
+{
+    float3 rB;      // contact point on the rigid, in its local space
+    float3 C0;      // constraint error at the start of the step
+    float3 penalty; // penalty parameters (normal, tangent, tangent)
+    float3 lambda;  // dual variables / contact force
+    float3x3 basis; // row 0 = contact normal (rigid -> particle), rows 1-2 tangents
+    float friction;
+    bool active;
+
+    ParticleContact(Solver *solver, Particle *particle, Rigid *rigid);
+
+    bool initialize() override;
+    void updatePrimal(Body *body, float alpha, float3x3 &lhsLin, float3x3 &lhsAng, float3x3 &lhsCross, float3 &rhsLin, float3 &rhsAng) override;
+    void updateDual(float alpha) override;
+};
+
+// A triangle-mesh cloth: builds particles, FEMTriangle membrane elements, and
+// BendEdge bending elements from a triangle mesh. The particles are owned by the
+// solver; this struct keeps the ordered particle array for read-back.
+struct Cloth
+{
+    Solver *solver;
+    Particle **particles;
+    int numParticles;
+
+    // verts: numVerts world-space positions. triangles: 3 indices per triangle.
+    Cloth(Solver *solver, const float3 *verts, int numVerts,
+          const int *triangles, int numTriangles,
+          float density, float thickness, float youngsModulus, float poisson,
+          float bendStiffness, float particleRadius, float friction);
+    ~Cloth();
+};
+
+// Core solver class which holds all the bodies and forces, and has logic to step the simulation forward in time
 struct Solver
 {
     float dt;       // Timestep
@@ -230,7 +338,7 @@ struct Solver
     float sleepThresholdAng; // Angular speed below which a body counts as resting
     float sleepTime;         // Time below the thresholds before a body sleeps
 
-    Rigid *bodies;
+    Body *bodies;
     Force *forces;
 
     int threads;      // Worker lane count for the solver (0 = hardware concurrency)

@@ -38,6 +38,7 @@ extern "C"
     typedef struct AvbdSolver AvbdSolver;
     typedef struct AvbdBody AvbdBody;
     typedef struct AvbdForce AvbdForce;
+    typedef struct AvbdCloth AvbdCloth;
 
     /* --- Solver lifecycle ------------------------------------------------- */
 
@@ -117,6 +118,31 @@ extern "C"
 
     /* Returns non-zero if the body is currently asleep (frozen). */
     AVBD_API int avbd_body_is_asleep(AvbdBody *body);
+
+    /* --- Cloth (triangle FEM) -------------------------------------------- */
+
+    /*
+     * Adds a triangle-FEM cloth. `verts` is numVerts * 3 floats (world space),
+     * `triangles` is numTriangles * 3 vertex indices. Material is given by
+     * Young's modulus, Poisson's ratio, and a separate bending stiffness.
+     * Returns a handle owning the ordered particle list for read-back.
+     */
+    AVBD_API AvbdCloth *avbd_add_cloth(AvbdSolver *solver, const float *verts, int numVerts,
+                                       const int *triangles, int numTriangles,
+                                       float density, float thickness, float youngsModulus,
+                                       float poisson, float bendStiffness, float particleRadius,
+                                       float friction);
+
+    AVBD_API int avbd_cloth_vertex_count(AvbdCloth *cloth);
+
+    /* Writes the current cloth vertex positions into `out` (numVerts * 3 floats). */
+    AVBD_API void avbd_cloth_get_vertices(AvbdCloth *cloth, float *out);
+
+    /* Pins a cloth vertex in place (makes that particle static). */
+    AVBD_API void avbd_cloth_pin_vertex(AvbdCloth *cloth, int index);
+
+    /* Frees the cloth handle. The particles themselves are freed with the solver. */
+    AVBD_API void avbd_cloth_destroy(AvbdCloth *cloth);
 
 #ifdef __cplusplus
 }

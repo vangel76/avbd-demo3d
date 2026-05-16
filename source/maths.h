@@ -478,6 +478,32 @@ inline float3x3 diagonalize(float3x3 m)
     return diagonal(length(m.col(0)), length(m.col(1)), length(m.col(2)));
 }
 
+// Solves the 3x3 linear system A x = b (A invertible; used for the 3-DOF
+// particle primal update). Returns zero if A is numerically singular.
+inline float3 solve3(float3x3 A, float3 b)
+{
+    float c00 = A[1][1] * A[2][2] - A[1][2] * A[2][1];
+    float c01 = A[1][2] * A[2][0] - A[1][0] * A[2][2];
+    float c02 = A[1][0] * A[2][1] - A[1][1] * A[2][0];
+    float det = A[0][0] * c00 + A[0][1] * c01 + A[0][2] * c02;
+    if (fabsf(det) < 1.0e-20f)
+        return float3{0, 0, 0};
+    float inv = 1.0f / det;
+
+    float c10 = A[0][2] * A[2][1] - A[0][1] * A[2][2];
+    float c11 = A[0][0] * A[2][2] - A[0][2] * A[2][0];
+    float c12 = A[0][1] * A[2][0] - A[0][0] * A[2][1];
+    float c20 = A[0][1] * A[1][2] - A[0][2] * A[1][1];
+    float c21 = A[0][2] * A[1][0] - A[0][0] * A[1][2];
+    float c22 = A[0][0] * A[1][1] - A[0][1] * A[1][0];
+
+    // x = A^-1 b, with A^-1 = adjugate(A) / det
+    return float3{
+        inv * (c00 * b.x + c10 * b.y + c20 * b.z),
+        inv * (c01 * b.x + c11 * b.y + c21 * b.z),
+        inv * (c02 * b.x + c12 * b.y + c22 * b.z)};
+}
+
 inline void solve(float3x3 aLin, float3x3 aAng, float3x3 aCross, float3 bLin, float3 bAng, float3 &xLin, float3 &xAng)
 {
     // Extract elements from lower triangle storage

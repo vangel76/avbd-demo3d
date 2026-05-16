@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "avbd_physics"
-version = "0.2.0"
+version = "0.3.1"
 name = "AVBD Physics"
 tagline = "Augmented Vertex Block Descent rigid body simulation"
 maintainer = "Chris Giles"

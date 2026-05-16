@@ -16,6 +16,7 @@ from bpy.props import (
     FloatProperty,
     IntProperty,
     PointerProperty,
+    StringProperty,
 )
 
 
@@ -77,8 +78,9 @@ class AvbdBodySettings(bpy.types.PropertyGroup):
     body_type: EnumProperty(
         name="Type",
         items=[
-            ('ACTIVE', "Active", "Dynamic body driven by the simulation"),
+            ('ACTIVE', "Active", "Dynamic rigid body driven by the simulation"),
             ('PASSIVE', "Passive", "Static collider that does not move"),
+            ('CLOTH', "Cloth", "Triangle-FEM cloth simulated from this mesh"),
         ],
         default='ACTIVE')
     collision_shape: EnumProperty(
@@ -94,6 +96,23 @@ class AvbdBodySettings(bpy.types.PropertyGroup):
     friction: FloatProperty(
         name="Friction", default=0.5, min=0.0,
         description="Coulomb friction coefficient")
+
+    # --- Cloth (triangle FEM) settings ---
+    cloth_youngs: FloatProperty(
+        name="Stiffness", default=1000.0, min=0.0,
+        description="Young's modulus of the cloth membrane")
+    cloth_poisson: FloatProperty(
+        name="Poisson Ratio", default=0.3, min=0.0, max=0.49,
+        description="Cloth Poisson ratio (lateral contraction under stretch)")
+    cloth_bend: FloatProperty(
+        name="Bend Stiffness", default=0.5, min=0.0,
+        description="Resistance to folding")
+    cloth_thickness: FloatProperty(
+        name="Thickness", default=0.01, min=1.0e-4,
+        description="Cloth thickness; also sets the collision radius")
+    cloth_pin_group: StringProperty(
+        name="Pinned Group",
+        description="Vertex group whose vertices are pinned in place")
 
 
 class AvbdConstraintSettings(bpy.types.PropertyGroup):

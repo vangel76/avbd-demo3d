@@ -121,6 +121,16 @@ class BodyRecord:
         self.local_com = local_com  # COM offset in the object's scaled local frame
 
 
+class ClothRecord:
+    """Tracks a baked cloth and how to map its vertices back to the mesh."""
+
+    __slots__ = ("cloth", "world_to_local")
+
+    def __init__(self, cloth, world_to_local):
+        self.cloth = cloth
+        self.world_to_local = world_to_local  # matrix_world inverse at build time
+
+
 def frame_timestep(scene):
     """Seconds of simulation time per Blender frame.
 
@@ -135,9 +145,18 @@ def frame_timestep(scene):
 
 
 def iter_bodies(scene):
-    """Yields scene objects that are AVBD rigid bodies."""
+    """Yields scene objects that are AVBD rigid bodies (active or passive)."""
     for obj in scene.objects:
-        if obj.type == 'MESH' and obj.avbd_body.enabled:
+        if (obj.type == 'MESH' and obj.avbd_body.enabled
+                and obj.avbd_body.body_type in ('ACTIVE', 'PASSIVE')):
+            yield obj
+
+
+def iter_cloths(scene):
+    """Yields scene objects that are AVBD cloth."""
+    for obj in scene.objects:
+        if (obj.type == 'MESH' and obj.avbd_body.enabled
+                and obj.avbd_body.body_type == 'CLOTH'):
             yield obj
 
 
@@ -197,8 +216,44 @@ def build_solver(context):
         body.transform = ((pos.x, pos.y, pos.z), (rot.w, rot.x, rot.y, rot.z))
         records[obj.name] = BodyRecord(body, com)
 
+    for obj in iter_cloths(scene):
+        cloth_record = _build_cloth(solver, obj)
+        if cloth_record is not None:
+            records[obj.name] = cloth_record
+
     _build_constraints(solver, scene, records)
     return solver, records
+
+
+def _build_cloth(solver, obj):
+    """Builds a triangle-FEM cloth from a Blender mesh object."""
+    bs = obj.avbd_body
+    mesh = obj.data
+    mw = obj.matrix_world
+
+    verts = [tuple(mw @ v.co) for v in mesh.vertices]
+    mesh.calc_loop_triangles()
+    tris = [tuple(lt.vertices) for lt in mesh.loop_triangles]
+    if not verts or not tris:
+        return None
+
+    cloth = solver.add_cloth(
+        verts, tris, density=bs.density, thickness=bs.cloth_thickness,
+        youngs_modulus=bs.cloth_youngs, poisson=bs.cloth_poisson,
+        bend_stiffness=bs.cloth_bend, particle_radius=bs.cloth_thickness * 0.5,
+        friction=bs.friction)
+
+    # Pin the vertices belonging to the chosen vertex group.
+    group = obj.vertex_groups.get(bs.cloth_pin_group) if bs.cloth_pin_group else None
+    if group is not None:
+        gi = group.index
+        for v in mesh.vertices:
+            for g in v.groups:
+                if g.group == gi and g.weight > 0.0:
+                    cloth.pin(v.index)
+                    break
+
+    return ClothRecord(cloth, mw.inverted())
 
 
 def _build_constraints(solver, scene, records):
@@ -209,8 +264,8 @@ def _build_constraints(solver, scene, records):
             continue
         rec_a = records.get(cs.object_a.name)
         rec_b = records.get(cs.object_b.name)
-        if rec_a is None or rec_b is None:
-            continue
+        if not isinstance(rec_a, BodyRecord) or not isinstance(rec_b, BodyRecord):
+            continue  # constraints are only supported between rigid bodies
 
         # Anchor: the constraint object's world position, expressed in each
         # body's local frame.
@@ -268,3 +323,31 @@ def read_active_bodies(scene, records):
     for (obj, record), (com_world, quat_wxyz) in zip(items, transforms):
         _apply_transform(obj, record, com_world, quat_wxyz)
     return len(bodies)
+
+
+def read_cloths(scene, records):
+    """Writes every cloth's simulated vertices back onto its Blender mesh."""
+    for name, record in records.items():
+        if not isinstance(record, ClothRecord):
+            continue
+        obj = scene.objects.get(name)
+        if obj is None:
+            continue
+        positions = record.cloth.vertices()
+        mesh = obj.data
+        w2l = record.world_to_local
+        count = min(len(positions), len(mesh.vertices))
+        for i in range(count):
+            mesh.vertices[i].co = w2l @ Vector(positions[i])
+        mesh.update()
+
+
+def cloth_local_positions(scene, records):
+    """Returns {object_name: [local-space vertex tuples]} for all cloths."""
+    result = {}
+    for name, record in records.items():
+        if not isinstance(record, ClothRecord):
+            continue
+        w2l = record.world_to_local
+        result[name] = [tuple(w2l @ Vector(p)) for p in record.cloth.vertices()]
+    return result

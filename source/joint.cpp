@@ -32,6 +32,9 @@ Joint::Joint(Solver* solver, Rigid* bodyA, Rigid* bodyB, float3 rA, float3 rB, f
 
 bool Joint::initialize()
 {
+    Rigid* bodyA = (Rigid*)bodies[0];
+    Rigid* bodyB = (Rigid*)bodies[1];
+
     // Store constraint function at beginnning of timestep C(x-)
     // Note: if bodyA is null, it is assumed that the joint connects a body to the world space position rA
     C0Lin = (bodyA ? transform(bodyA->positionLin, bodyA->positionAng, rA) : rA) - transform(bodyB->positionLin, bodyB->positionAng, rB);
@@ -51,8 +54,11 @@ bool Joint::initialize()
     return !broken;
 }
 
-void Joint::updatePrimal(Rigid* body, float alpha, float3x3& lhsLin, float3x3& lhsAng, float3x3& lhsCross, float3& rhsLin, float3& rhsAng)
+void Joint::updatePrimal(Body* body, float alpha, float3x3& lhsLin, float3x3& lhsAng, float3x3& lhsCross, float3& rhsLin, float3& rhsAng)
 {
+    Rigid* bodyA = (Rigid*)bodies[0];
+    Rigid* bodyB = (Rigid*)bodies[1];
+
     // Linear constraint
     if (lengthSq(penaltyLin) > 0)
     {
@@ -120,6 +126,9 @@ void Joint::updatePrimal(Rigid* body, float alpha, float3x3& lhsLin, float3x3& l
 
 void Joint::updateDual(float alpha)
 {
+    Rigid* bodyA = (Rigid*)bodies[0];
+    Rigid* bodyB = (Rigid*)bodies[1];
+
     // Linear constraint
     if (lengthSq(penaltyLin) > 0)
     {

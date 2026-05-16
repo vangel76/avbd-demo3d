@@ -12,7 +12,7 @@
 #include "solver.h"
 
 Spring::Spring(Solver* solver, Rigid* bodyA, Rigid* bodyB, float3 rA, float3 rB, float stiffness, float rest)
-    : Force(solver, bodyA, bodyB), rA(rA), rB(rB), rest(rest), stiffness(stiffness)
+    : Force(solver, bodyA, bodyB), rA(rA), rB(rB), rest(rest), stiffness(stiffness), penalty(0.0f)
 {
     if (this->rest < 0.0f)
     {
@@ -22,9 +22,21 @@ Spring::Spring(Solver* solver, Rigid* bodyA, Rigid* bodyB, float3 rA, float3 rB,
     }
 }
 
-void Spring::updatePrimal(Rigid* body, float alpha, float3x3& lhsLin, float3x3& lhsAng, float3x3& lhsCross, float3& rhsLin, float3& rhsAng)
+bool Spring::initialize()
+{
+    // Warmstart the penalty parameter (Eq. 19), decayed so it can shrink again,
+    // and capped at the material stiffness. A spring is a finite-stiffness force,
+    // so it has no dual variable: the ramped penalty is used directly (Sec. 3.4).
+    penalty = clamp(penalty * solver->gamma, PENALTY_MIN, PENALTY_MAX);
+    penalty = min(penalty, stiffness);
+    return true;
+}
+
+void Spring::updatePrimal(Body* body, float alpha, float3x3& lhsLin, float3x3& lhsAng, float3x3& lhsCross, float3& rhsLin, float3& rhsAng)
 {
     (void)alpha;
+    Rigid* bodyA = (Rigid*)bodies[0];
+    Rigid* bodyB = (Rigid*)bodies[1];
 
     float3 pA = transform(bodyA->positionLin, bodyA->positionAng, rA);
     float3 pB = transform(bodyB->positionLin, bodyB->positionAng, rB);
@@ -35,7 +47,9 @@ void Spring::updatePrimal(Rigid* body, float alpha, float3x3& lhsLin, float3x3& 
 
     float3 n = d / dLen;
     float C = dLen - rest;
-    float f = stiffness * C;
+
+    // Force uses the ramped penalty stiffness, not the full material stiffness.
+    float f = penalty * C;
 
     float3 rWorld;
     float3 jLin;
@@ -55,9 +69,17 @@ void Spring::updatePrimal(Rigid* body, float alpha, float3x3& lhsLin, float3x3& 
 
     float3 F = jLin * f;
     float3 Tau = jAng * f;
-    float3x3 Kll = outer(jLin, jLin) * stiffness;
-    float3x3 Kla = outer(jAng, jLin) * stiffness;
-    float3x3 Kaa = outer(jAng, jAng) * stiffness;
+
+    // Material (Gauss-Newton) term of the Hessian.
+    float3x3 Kll = outer(jLin, jLin) * penalty;
+    float3x3 Kla = outer(jAng, jLin) * penalty;
+    float3x3 Kaa = outer(jAng, jAng) * penalty;
+
+    // Geometric stiffness of the linear block (Sec. 3.5): the spring direction
+    // rotates as it deflects. Only added when in tension so the block stays SPD.
+    float geo = f > 0.0f ? f / dLen : 0.0f;
+    if (geo > 0.0f)
+        Kll += (diagonal(1, 1, 1) - outer(n, n)) * geo;
 
     lhsLin += Kll;
     lhsAng += Kaa;
@@ -69,4 +91,14 @@ void Spring::updatePrimal(Rigid* body, float alpha, float3x3& lhsLin, float3x3& 
 void Spring::updateDual(float alpha)
 {
     (void)alpha;
+    Rigid* bodyA = (Rigid*)bodies[0];
+    Rigid* bodyB = (Rigid*)bodies[1];
+
+    // Ramp the penalty stiffness toward the material stiffness based on the
+    // current constraint violation (Eq. 16).
+    float3 pA = transform(bodyA->positionLin, bodyA->positionAng, rA);
+    float3 pB = transform(bodyB->positionLin, bodyB->positionAng, rB);
+    float C = length(pA - pB) - rest;
+
+    penalty = min(penalty + solver->betaLin * fabsf(C), min(stiffness, PENALTY_MAX));
 }

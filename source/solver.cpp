@@ -44,12 +44,13 @@ Rigid *Solver::pick(float3 origin, float3 dir, float3 &local)
     Rigid *bestBody = 0;
     float3 bestLocal = {0, 0, 0};
 
-    // Ray-cast against each body's oriented box (the AABB extents for hull bodies)
+    // Ray-cast against each rigid body's oriented box (AABB extents for hulls)
     // by transforming the ray into body local space.
-    for (Rigid *body = bodies; body != 0; body = body->next)
+    for (Body *b = bodies; b != 0; b = b->next)
     {
-        if (body->mass <= 0.0f)
+        if (b->kind != BODY_RIGID || b->mass <= 0.0f)
             continue;
+        Rigid *body = (Rigid *)b;
 
         quat invRot = conjugate(body->positionAng);
         float3 o = rotate(invRot, origin - body->positionLin);
@@ -131,26 +132,20 @@ void Solver::defaultParams()
     // Note: in the paper, beta is suggested to be [1, 1000]. Technically, the best choice will
     // depend on the length, mass, and constraint function scales (ie units) of your simulation,
     // along with your strategy for incrementing the penalty parameters.
-    // If the value is not in the right range, you may see slower convergance for complex scenes.
-    // A minor upgrade from the paper is using separate betas for constraints of different units (eg linear vs angular).
     betaLin = 10000.0f;
     betaAng = 100.0f;
 
     // Alpha controls how much stabilization is applied. Higher values give slower and smoother
-    // error correction, and lower values are more responsive and energetic. Tune this depending
-    // on your desired constraint error response.
+    // error correction, and lower values are more responsive and energetic.
     alpha = 0.99f;
 
     // Gamma controls how much the penalty and lambda values are decayed each step during warmstarting.
-    // This should always be < 1 so that the penalty values can decrease (unless you use a different
-    // penalty parameter strategy which does not require decay).
     gamma = 0.999f;
 
     // 0 selects the hardware concurrency for the thread pool.
     threads = 0;
 
-    // Sleeping is enabled by default. The thresholds are in simulation units
-    // (length / second and radians / second); tune them via setSleeping.
+    // Sleeping is enabled by default.
     sleepEnabled = true;
     sleepThresholdLin = 0.05f;
     sleepThresholdAng = 0.05f;
@@ -159,14 +154,18 @@ void Solver::defaultParams()
 
 namespace
 {
-// Solves the primal linear system for a single dynamic body and applies the
-// position update (Eqs. 4-6). Shared by the serial and parallel paths so the
-// solver behaviour is identical regardless of thread count.
-void updateBodyPrimal(Solver *solver, Rigid *body)
+// Walks the force list of `body` (each body threads its own list through the
+// matching Force::bodyNext slot).
+inline Force *nextForce(Force *f, const Body *body)
+{
+    return f->bodyNext[f->slotOf(body)];
+}
+
+// Primal update for a 6-DOF rigid body: assemble and solve the 6x6 SPD system.
+void updateRigidPrimal(Solver *solver, Rigid *body)
 {
     float dt = solver->dt;
 
-    // Initialize left and right hand sides of the linear system (Eqs. 5, 6)
     float3x3 MLin = diagonal(body->mass, body->mass, body->mass);
     float3x3 MAng = diagonal(body->moment.x, body->moment.y, body->moment.z);
 
@@ -177,18 +176,34 @@ void updateBodyPrimal(Solver *solver, Rigid *body)
     float3 rhsLin = MLin / (dt * dt) * (body->positionLin - body->inertialLin);
     float3 rhsAng = MAng / (dt * dt) * (body->positionAng - body->inertialAng);
 
-    // Iterate over all forces acting on the body
-    for (Force *force = body->forces; force != 0; force = (force->bodyA == body) ? force->nextA : force->nextB)
-        force->updatePrimal(body, solver->alpha, lhsLin, lhsAng, lhsCross, rhsLin, rhsAng);
+    for (Force *f = body->forces; f != 0; f = nextForce(f, body))
+        f->updatePrimal(body, solver->alpha, lhsLin, lhsAng, lhsCross, rhsLin, rhsAng);
 
-    // Solve the SPD linear system using LDL and apply the update (Eq. 4)
     float3 dxLin, dxAng;
     solve(lhsLin, lhsAng, lhsCross, -rhsLin, -rhsAng, dxLin, dxAng);
     body->positionLin = body->positionLin + dxLin;
     body->positionAng = body->positionAng + dxAng;
 }
 
-// Packs integer cell coordinates into a 64-bit spatial-hash key (21 bits/axis).
+// Primal update for a 3-DOF particle: assemble and solve the 3x3 SPD system.
+// Particle-aware forces stamp only the linear blocks.
+void updateParticlePrimal(Solver *solver, Particle *body)
+{
+    float dt = solver->dt;
+    float m = body->mass;
+
+    float3x3 lhsLin = diagonal(m, m, m) / (dt * dt);
+    float3x3 lhsAng = float3x3{0, 0, 0, 0, 0, 0, 0, 0, 0};
+    float3x3 lhsCross = lhsAng;
+    float3 rhsLin = lhsLin * (body->positionLin - body->inertialLin);
+    float3 rhsAng = float3{0, 0, 0};
+
+    for (Force *f = body->forces; f != 0; f = nextForce(f, body))
+        f->updatePrimal(body, solver->alpha, lhsLin, lhsAng, lhsCross, rhsLin, rhsAng);
+
+    body->positionLin = body->positionLin + solve3(lhsLin, -rhsLin);
+}
+
 inline uint64_t packCell(int x, int y, int z)
 {
     uint64_t ux = (uint64_t)((unsigned)(x + 1048576)) & 0x1FFFFFu;
@@ -197,19 +212,16 @@ inline uint64_t packCell(int x, int y, int z)
     return ux | (uy << 21) | (uz << 42);
 }
 
-// Broadphase collision detection using a uniform spatial hash. The cell size is
-// derived from the median body radius. Bodies far larger than a cell (eg ground
-// planes) would smear across the whole grid, so they are split into a separate
-// list and tested against everything. Each body writes its colliding partners
-// into a private bucket, so the whole pass is lock-free and parallelizable.
-void broadphase(const std::vector<Rigid *> &bodies, ThreadPool *pool,
-                std::vector<std::vector<Rigid *>> &pairs)
+// Broadphase collision detection using a uniform spatial hash. Only rigid-rigid
+// pairs are emitted here (particle collision is handled separately). Each body
+// writes its colliding partners into a private bucket, so the pass is lock-free.
+void broadphase(const std::vector<Body *> &bodies, ThreadPool *pool,
+                std::vector<std::vector<Body *>> &pairs)
 {
     int n = (int)bodies.size();
     if (n < 2)
         return;
 
-    // Cell size from the median radius.
     std::vector<float> radii(n);
     for (int i = 0; i < n; ++i)
         radii[i] = bodies[i]->radius;
@@ -221,7 +233,6 @@ void broadphase(const std::vector<Rigid *> &bodies, ThreadPool *pool,
     float invCell = 1.0f / cell;
     float largeRadius = cell * 2.0f;
 
-    // Split bodies into small (hashed) and large (tested against all).
     std::vector<int> small, large;
     float maxSmallRadius = 0.0f;
     for (int i = 0; i < n; ++i)
@@ -237,7 +248,6 @@ void broadphase(const std::vector<Rigid *> &bodies, ThreadPool *pool,
 
     auto coord = [invCell](float v) { return (int)floorf(v * invCell); };
 
-    // Hash the small bodies by the cell containing their centre.
     std::unordered_map<uint64_t, std::vector<int>> grid;
     grid.reserve(small.size() * 2 + 1);
     for (int idx : small)
@@ -246,10 +256,9 @@ void broadphase(const std::vector<Rigid *> &bodies, ThreadPool *pool,
         grid[packCell(coord(p.x), coord(p.y), coord(p.z))].push_back(idx);
     }
 
-    // Small vs small: query the cells within reach of each small body.
     pool->parallelFor((int)small.size(), [&](int si) {
         int i = small[si];
-        Rigid *a = bodies[i];
+        Body *a = bodies[i];
         float3 p = a->positionLin;
         int cx = coord(p.x), cy = coord(p.y), cz = coord(p.z);
         int range = (int)ceilf((a->radius + maxSmallRadius) * invCell) + 1;
@@ -264,7 +273,9 @@ void broadphase(const std::vector<Rigid *> &bodies, ThreadPool *pool,
                     {
                         if (j <= i)
                             continue;
-                        Rigid *b = bodies[j];
+                        Body *b = bodies[j];
+                        if (a->kind == BODY_PARTICLE && b->kind == BODY_PARTICLE)
+                            continue; // no particle self-collision
                         float3 dp = p - b->positionLin;
                         float r = a->radius + b->radius;
                         if (dot(dp, dp) <= r * r && !a->constrainedTo(b))
@@ -273,17 +284,16 @@ void broadphase(const std::vector<Rigid *> &bodies, ThreadPool *pool,
                 }
     });
 
-    // Large bodies: test against every other body. A large/large pair is emitted
-    // by the lower index; a large/small pair is emitted here (the small body's
-    // hash query never sees large bodies).
     pool->parallelFor((int)large.size(), [&](int li) {
         int i = large[li];
-        Rigid *a = bodies[i];
+        Body *a = bodies[i];
         for (int j = 0; j < n; ++j)
         {
             if (j == i)
                 continue;
-            Rigid *b = bodies[j];
+            Body *b = bodies[j];
+            if (a->kind == BODY_PARTICLE && b->kind == BODY_PARTICLE)
+                continue; // no particle self-collision
             bool bLarge = b->radius > largeRadius;
             if (bLarge && j <= i)
                 continue;
@@ -298,9 +308,9 @@ void broadphase(const std::vector<Rigid *> &bodies, ThreadPool *pool,
 
 void Solver::step()
 {
-    // Gather the bodies into a contiguous array for indexed parallel access.
-    std::vector<Rigid *> bodyList;
-    for (Rigid *body = bodies; body != 0; body = body->next)
+    // Gather all bodies into a contiguous array for indexed parallel access.
+    std::vector<Body *> bodyList;
+    for (Body *body = bodies; body != 0; body = body->next)
     {
         body->index = (int)bodyList.size();
         body->color = -1;
@@ -308,17 +318,25 @@ void Solver::step()
     }
     int numBodies = (int)bodyList.size();
 
-    // Broadphase collision detection via a spatial hash. Each body collects its
-    // colliding partners into a private bucket (lock-free, parallelized), then
-    // manifolds are created serially because they mutate the force linked lists.
-    std::vector<std::vector<Rigid *>> pairs(numBodies);
+    // Broadphase collision detection; create the matching contact force for
+    // each pair (rigid-rigid Manifold or particle-rigid ParticleContact).
+    std::vector<std::vector<Body *>> pairs(numBodies);
     broadphase(bodyList, pool, pairs);
     for (int i = 0; i < numBodies; ++i)
-        for (Rigid *bodyB : pairs[i])
-            new Manifold(this, bodyList[i], bodyB);
+        for (Body *bodyB : pairs[i])
+        {
+            Body *a = bodyList[i];
+            if (a->kind == BODY_RIGID && bodyB->kind == BODY_RIGID)
+                new Manifold(this, (Rigid *)a, (Rigid *)bodyB);
+            else
+            {
+                Particle *p = (Particle *)(a->kind == BODY_PARTICLE ? a : bodyB);
+                Rigid *r = (Rigid *)(a->kind == BODY_RIGID ? a : bodyB);
+                new ParticleContact(this, p, r);
+            }
+        }
 
-    // Initialize and warmstart forces. Initialization can cache anything constant
-    // over the step; a force returning false is inactive and removed.
+    // Initialize and warmstart forces; an inactive force returns false.
     for (Force *force = forces; force != 0;)
     {
         if (!force->initialize())
@@ -331,88 +349,87 @@ void Solver::step()
             force = force->next;
     }
 
-    // Gather the (post-initialization) forces into a contiguous array.
     std::vector<Force *> forceList;
     for (Force *force = forces; force != 0; force = force->next)
         forceList.push_back(force);
     int numForces = (int)forceList.size();
 
-    // Wake any sleeping body that shares a constraint with an awake dynamic
-    // body, so a disturbance propagates into resting regions over a few frames.
+    // Wake any sleeping body that shares a force with an awake dynamic body.
     if (sleepEnabled)
     {
         for (Force *force : forceList)
         {
-            Rigid *a = force->bodyA;
-            Rigid *b = force->bodyB;
-            if (!a || !b)
-                continue;
-            if (a->mass > 0 && !a->asleep && b->mass > 0 && b->asleep)
+            bool anyAwake = false;
+            for (int k = 0; k < force->numBodies; ++k)
             {
-                b->asleep = false;
-                b->sleepTimer = 0.0f;
+                Body *b = force->bodies[k];
+                if (b && b->mass > 0 && !b->asleep)
+                    anyAwake = true;
             }
-            if (b->mass > 0 && !b->asleep && a->mass > 0 && a->asleep)
+            if (!anyAwake)
+                continue;
+            for (int k = 0; k < force->numBodies; ++k)
             {
-                a->asleep = false;
-                a->sleepTimer = 0.0f;
+                Body *b = force->bodies[k];
+                if (b && b->mass > 0 && b->asleep)
+                {
+                    b->asleep = false;
+                    b->sleepTimer = 0.0f;
+                }
             }
         }
     }
 
-    // Initialize and warmstart bodies (ie primal variables). Each body is
-    // independent here, so this runs in parallel.
+    // Initialize and warmstart bodies (primal variables).
     pool->parallelFor(numBodies, [&](int i) {
-        Rigid *body = bodyList[i];
+        Body *body = bodyList[i];
         if (body->asleep)
-            return; // frozen bodies are not warmstarted
+            return;
 
-        // Compute inertial position (Eq 2)
+        // Inertial position (Eq. 2) + adaptive warmstart (original VBD paper).
         body->inertialLin = body->positionLin + body->velocityLin * dt;
         if (body->mass > 0)
             body->inertialLin += float3{0, 0, gravity} * (dt * dt);
-        body->inertialAng = body->positionAng + body->velocityAng * dt;
 
-        // Adaptive warmstart (See original VBD paper)
         float3 accel = (body->velocityLin - body->prevVelocityLin) / dt;
-        float accelExt = accel.z * sign(gravity);
-        float accelWeight = clamp(accelExt / abs(gravity), 0.0f, 1.0f);
+        float accelWeight = clamp(accel.z * sign(gravity) / abs(gravity), 0.0f, 1.0f);
         if (!isfinite(accelWeight))
             accelWeight = 0.0f;
 
-        // Save initial position (x-) and compute warmstarted position (See original VBD paper)
         body->initialLin = body->positionLin;
-        body->initialAng = body->positionAng;
         if (body->mass > 0)
-        {
             body->positionLin = body->positionLin + body->velocityLin * dt + float3{0, 0, gravity} * (accelWeight * dt * dt);
-            body->positionAng = body->positionAng + body->velocityAng * dt;
+
+        if (body->kind == BODY_RIGID)
+        {
+            Rigid *r = (Rigid *)body;
+            r->inertialAng = r->positionAng + r->velocityAng * dt;
+            r->initialAng = r->positionAng;
+            if (r->mass > 0)
+                r->positionAng = r->positionAng + r->velocityAng * dt;
         }
     });
 
-    // Graph-colour the dynamic bodies so that bodies sharing a constraint never
-    // receive the same colour. Bodies of one colour can then be solved in
-    // parallel (colored Gauss-Seidel, as in the AVBD paper, Algorithm 1).
-    std::vector<std::vector<Rigid *>> colorBuckets;
-    for (Rigid *body : bodyList)
+    // Graph-colour the dynamic bodies (colored Gauss-Seidel, AVBD Algorithm 1).
+    std::vector<std::vector<Body *>> colorBuckets;
+    for (Body *body : bodyList)
     {
         if (body->mass <= 0 || body->asleep)
-            continue; // static and sleeping bodies are not degrees of freedom
+            continue;
 
-        // Mark the colours used by constrained neighbours.
         std::vector<bool> used;
-        for (Force *f = body->forces; f != 0; f = (f->bodyA == body) ? f->nextA : f->nextB)
-        {
-            Rigid *other = (f->bodyA == body) ? f->bodyB : f->bodyA;
-            if (other && other->mass > 0 && other->color >= 0)
+        for (Force *f = body->forces; f != 0; f = nextForce(f, body))
+            for (int k = 0; k < f->numBodies; ++k)
             {
-                if ((int)used.size() <= other->color)
-                    used.resize(other->color + 1, false);
-                used[other->color] = true;
+                Body *other = f->bodies[k];
+                if (other && other != body && other->mass > 0 && other->color >= 0)
+                {
+                    if ((int)used.size() <= other->color)
+                        used.resize(other->color + 1, false);
+                    used[other->color] = true;
+                }
             }
-        }
 
-        // Pick the lowest unused colour.
         int c = 0;
         while (c < (int)used.size() && used[c])
             ++c;
@@ -425,57 +442,69 @@ void Solver::step()
     // Main solver loop
     for (int it = 0; it < iterations; it++)
     {
-        // Primal update: one colour at a time, the bodies within a colour in parallel.
-        for (std::vector<Rigid *> &bucket : colorBuckets)
+        // Primal update: one colour at a time, bodies within a colour in parallel.
+        for (std::vector<Body *> &bucket : colorBuckets)
         {
             int n = (int)bucket.size();
-            pool->parallelFor(n, [&](int i) { updateBodyPrimal(this, bucket[i]); });
+            pool->parallelFor(n, [&](int i) {
+                Body *body = bucket[i];
+                if (body->kind == BODY_RIGID)
+                    updateRigidPrimal(this, (Rigid *)body);
+                else
+                    updateParticlePrimal(this, (Particle *)body);
+            });
         }
 
-        // Dual update: every force is independent, so this runs fully in
-        // parallel. Forces between only static/sleeping bodies are skipped.
+        // Dual update: every force is independent.
         pool->parallelFor(numForces, [&](int i) {
             Force *f = forceList[i];
-            Rigid *a = f->bodyA;
-            Rigid *b = f->bodyB;
-            bool aActive = a && a->mass > 0 && !a->asleep;
-            bool bActive = b && b->mass > 0 && !b->asleep;
-            if (aActive || bActive)
+            bool anyActive = false;
+            for (int k = 0; k < f->numBodies; ++k)
+            {
+                Body *b = f->bodies[k];
+                if (b && b->mass > 0 && !b->asleep)
+                    anyActive = true;
+            }
+            if (anyActive)
                 f->updateDual(alpha);
         });
     }
 
     // Compute velocities (BDF1) after the final iteration.
     pool->parallelFor(numBodies, [&](int i) {
-        Rigid *body = bodyList[i];
+        Body *body = bodyList[i];
         if (body->asleep)
-            return; // frozen bodies keep zero velocity
+            return;
         body->prevVelocityLin = body->velocityLin;
         if (body->mass > 0)
         {
             body->velocityLin = (body->positionLin - body->initialLin) / dt;
-            body->velocityAng = (body->positionAng - body->initialAng) / dt;
+            if (body->kind == BODY_RIGID)
+            {
+                Rigid *r = (Rigid *)body;
+                r->velocityAng = (r->positionAng - r->initialAng) / dt;
+            }
         }
     });
 
-    // Sleep pass: freeze dynamic bodies that stayed below the rest velocity
-    // thresholds for sleepTime seconds, eliminating resting jitter.
+    // Sleep pass: freeze dynamic bodies that stayed at rest for sleepTime.
     if (sleepEnabled)
     {
         pool->parallelFor(numBodies, [&](int i) {
-            Rigid *body = bodyList[i];
+            Body *body = bodyList[i];
             if (body->mass <= 0 || body->asleep)
                 return;
-            if (length(body->velocityLin) < sleepThresholdLin &&
-                length(body->velocityAng) < sleepThresholdAng)
+            float angSpeed = body->kind == BODY_RIGID ? length(((Rigid *)body)->velocityAng) : 0.0f;
+            if (length(body->velocityLin) < sleepThresholdLin && angSpeed < sleepThresholdAng)
             {
                 body->sleepTimer += dt;
                 if (body->sleepTimer >= sleepTime)
                 {
                     body->asleep = true;
                     body->velocityLin = float3{0, 0, 0};
-                    body->velocityAng = float3{0, 0, 0};
                     body->prevVelocityLin = float3{0, 0, 0};
+                    if (body->kind == BODY_RIGID)
+                        ((Rigid *)body)->velocityAng = float3{0, 0, 0};
                 }
             }
             else

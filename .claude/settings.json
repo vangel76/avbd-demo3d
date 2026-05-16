@@ -22,7 +22,11 @@
       "Bash(./build/Release/avbd_test.exe)",
       "Bash(cmake --build build --target avbd --config Release)",
       "Bash(/c/Users/vali/AppData/Local/Programs/Python/Python311/python.exe -c ' *)",
-      "Bash(cp fullpaper.txt \"c:/projekte/DevSoftware/avbd-demo3d/build/fullpaper.txt\")"
+      "Bash(cp fullpaper.txt \"c:/projekte/DevSoftware/avbd-demo3d/build/fullpaper.txt\")",
+      "Bash(cmake --build build --target avbd avbd_test --config Release)",
+      "Bash(cp build/Release/avbd.dll addon/avbd_physics/lib/windows-x64/avbd.dll)",
+      "Bash(/c/Users/vali/AppData/Local/Programs/Python/Python311/python.exe tests/test_api.py)",
+      "Bash(\"C:/Blender/daily/blender-4.5.9-stable+daily.8bf95cbd38d1/blender.exe\" --background --factory-startup --python tests/test_blender.py)"
     ]
   }
 }

@@ -17,7 +17,7 @@ Blender objects.
 bl_info = {
     "name": "AVBD Physics",
     "author": "Chris Giles; AVBD by Giles, Diaz, Yuksel (SIGGRAPH 2025)",
-    "version": (0, 2, 0),
+    "version": (0, 3, 1),
     "blender": (3, 6, 0),
     "location": "Properties > Scene & Physics, View3D > Sidebar > AVBD",
     "description": "Augmented Vertex Block Descent rigid body physics (bake & live preview)",
@@ -36,9 +36,14 @@ def register():
     ui.register()
     # Shared flag so the UI and the live-preview modal operator can coordinate.
     bpy.types.WindowManager.avbd_live_running = BoolProperty(default=False)
+    # Frame-change handler that applies baked cloth deformation.
+    if operators.apply_cloth_cache not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(operators.apply_cloth_cache)
 
 
 def unregister():
+    if operators.apply_cloth_cache in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(operators.apply_cloth_cache)
     del bpy.types.WindowManager.avbd_live_running
     ui.unregister()
     operators.unregister()

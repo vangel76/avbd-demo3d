@@ -100,10 +100,11 @@ bool findShadowPlane(float3 &planePoint, float3 &planeNormal)
     float bestScore = 0.0f;
     bool found = false;
 
-    for (Rigid *body = solver->bodies; body != 0; body = body->next)
+    for (Body *bodyIt = solver->bodies; bodyIt != 0; bodyIt = bodyIt->next)
     {
-        if (body->mass > 0.0f)
+        if (bodyIt->kind != BODY_RIGID || bodyIt->mass > 0.0f)
             continue;
+        Rigid *body = (Rigid *)bodyIt;
 
         float3 half = body->size * 0.5f;
         float3 axes[3] = {
@@ -268,8 +269,10 @@ void drawBody(const Rigid *body)
 
 void drawJoint(const Joint *joint)
 {
-    float3 v0 = joint->bodyA ? transform(joint->bodyA->positionLin, joint->bodyA->positionAng, joint->rA) : joint->rA;
-    float3 v1 = transform(joint->bodyB->positionLin, joint->bodyB->positionAng, joint->rB);
+    const Rigid *bodyA = (const Rigid *)joint->bodies[0];
+    const Rigid *bodyB = (const Rigid *)joint->bodies[1];
+    float3 v0 = bodyA ? transform(bodyA->positionLin, bodyA->positionAng, joint->rA) : joint->rA;
+    float3 v1 = transform(bodyB->positionLin, bodyB->positionAng, joint->rB);
 
     glColor3f(0.75f, 0.0f, 0.0f);
     glBegin(GL_LINES);
@@ -280,8 +283,10 @@ void drawJoint(const Joint *joint)
 
 void drawSpring(const Spring *spring)
 {
-    float3 v0 = transform(spring->bodyA->positionLin, spring->bodyA->positionAng, spring->rA);
-    float3 v1 = transform(spring->bodyB->positionLin, spring->bodyB->positionAng, spring->rB);
+    const Rigid *bodyA = (const Rigid *)spring->bodies[0];
+    const Rigid *bodyB = (const Rigid *)spring->bodies[1];
+    float3 v0 = transform(bodyA->positionLin, bodyA->positionAng, spring->rA);
+    float3 v1 = transform(bodyB->positionLin, bodyB->positionAng, spring->rB);
 
     glColor3f(0.75f, 0.0f, 0.0f);
     glBegin(GL_LINES);
@@ -295,12 +300,14 @@ void drawManifold(const Manifold *manifold)
     if (!SHOW_CONTACTS)
         return;
 
+    const Rigid *bodyA = (const Rigid *)manifold->bodies[0];
+    const Rigid *bodyB = (const Rigid *)manifold->bodies[1];
     glColor3f(0.75f, 0.0f, 0.0f);
     glBegin(GL_POINTS);
     for (int i = 0; i < manifold->numContacts; ++i)
     {
-        float3 v0 = transform(manifold->bodyA->positionLin, manifold->bodyA->positionAng, manifold->contacts[i].rA);
-        float3 v1 = transform(manifold->bodyB->positionLin, manifold->bodyB->positionAng, manifold->contacts[i].rB);
+        float3 v0 = transform(bodyA->positionLin, bodyA->positionAng, manifold->contacts[i].rA);
+        float3 v1 = transform(bodyB->positionLin, bodyB->positionAng, manifold->contacts[i].rB);
         glVertex3f(v0.x, v0.y, v0.z);
         glVertex3f(v1.x, v1.y, v1.z);
     }
@@ -310,16 +317,16 @@ void drawManifold(const Manifold *manifold)
 void drawSolver(const Solver *state)
 {
     // Draw static receivers first so shadows depth-test against them.
-    for (const Rigid *body = state->bodies; body != 0; body = body->next)
-        if (body->mass <= 0.0f)
-            drawBody(body);
+    for (const Body *b = state->bodies; b != 0; b = b->next)
+        if (b->kind == BODY_RIGID && b->mass <= 0.0f)
+            drawBody((const Rigid *)b);
 
     drawProjectedShadows();
 
     // Draw dynamic bodies after shadows so they appear cleanly on top.
-    for (const Rigid *body = state->bodies; body != 0; body = body->next)
-        if (body->mass > 0.0f)
-            drawBody(body);
+    for (const Body *b = state->bodies; b != 0; b = b->next)
+        if (b->kind == BODY_RIGID && b->mass > 0.0f)
+            drawBody((const Rigid *)b);
 
     for (const Force *force = state->forces; force != 0; force = force->next)
     {
@@ -365,11 +372,11 @@ void drawProjectedShadows()
 
     auto drawProjectedCasters = [&]()
     {
-        for (Rigid *body = solver->bodies; body != 0; body = body->next)
+        for (Body *b = solver->bodies; b != 0; b = b->next)
         {
-            if (body->mass <= 0.0f)
+            if (b->kind != BODY_RIGID || b->mass <= 0.0f)
                 continue;
-            drawBodySolidProjected(body, shadowMat);
+            drawBodySolidProjected((Rigid *)b, shadowMat);
         }
     };
 

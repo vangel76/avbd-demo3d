@@ -24,12 +24,15 @@ endif()
 # ---------------------------------------------------------------------------
 set(AVBD_CORE_SOURCES
     source/solver.cpp
+    source/body.cpp
     source/rigid.cpp
     source/joint.cpp
     source/spring.cpp
     source/manifold.cpp
     source/collide.cpp
     source/convex.cpp
+    source/cloth.cpp
+    source/pcontact.cpp
     source/force.cpp
     source/parallel.cpp
 )

@@ -72,10 +72,22 @@ class AVBD_PT_body(bpy.types.Panel):
         col = layout.column()
         col.enabled = body.enabled
         col.prop(body, "body_type")
-        col.prop(body, "collision_shape")
-        if body.body_type == 'ACTIVE':
+
+        if body.body_type == 'CLOTH':
             col.prop(body, "density")
-        col.prop(body, "friction")
+            col.prop(body, "friction")
+            col.separator()
+            col.prop(body, "cloth_youngs")
+            col.prop(body, "cloth_poisson")
+            col.prop(body, "cloth_bend")
+            col.prop(body, "cloth_thickness")
+            col.prop_search(body, "cloth_pin_group",
+                            context.object, "vertex_groups")
+        else:
+            col.prop(body, "collision_shape")
+            if body.body_type == 'ACTIVE':
+                col.prop(body, "density")
+            col.prop(body, "friction")
 
 
 class AVBD_PT_constraint(bpy.types.Panel):
@@ -131,6 +143,7 @@ class AVBD_PT_viewport(bpy.types.Panel):
 
         layout.separator()
         layout.operator("avbd.make_test_scene", icon='MOD_BUILD')
+        layout.operator("avbd.make_cloth_scene", icon='MOD_CLOTH')
 
         layout.separator()
         col = layout.column(align=True)
